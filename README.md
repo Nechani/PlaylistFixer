@@ -1,11 +1,14 @@
-**Playlist Fixer** is a utility for repairing broken `.m3u / .m3u8` playlists  
+**Playlist Fixer** helps you recover and reuse playlists when music files still exist,  
+but paths, formats, or devices have changed.
+
+It is a utility for repairing broken `.m3u / .m3u8` playlists  
 when audio files are moved, renamed, converted, or used across different devices.
 
 It is designed for **file-based playlist users** — not tied to any specific player.
 
 ---
 
-## ✨ What Problem Does This Solve?
+## What Problem Does This Solve?
 
 If you ever experienced:
 
@@ -16,11 +19,11 @@ If you ever experienced:
 - Wanting to move **DAP playlists back to PC/Mac players**
 - Playlists partially working but **silently skipping songs**
 
-👉 **Playlist Fixer is built for exactly these situations.**
+ **Playlist Fixer is built for exactly these situations.**
 
 ---
 
-## 🔧 What Playlist Fixer Can Do
+## What Playlist Fixer Can Do
 
 - Repair broken `.m3u / .m3u8` playlists
 - Automatically re-link tracks by scanning your music library
@@ -38,7 +41,7 @@ If you ever experienced:
 
 ---
 
-## 🎧 DAP & Cross-Device Use
+## DAP & Cross-Device Use
 
 Playlist Fixer is especially useful if you:
 
@@ -54,7 +57,7 @@ It works at the **file & path level**, not player-specific logic.
 
 ---
 
-## 🧠 Why This Tool Exists
+## Why This Tool Exists
 
 Most players assume:
 > “If the path is broken, the playlist is dead.”
@@ -66,7 +69,7 @@ This tool is built for people who **organize music seriously** and rely on playl
 
 ---
 
-## 🖥️ Typical Workflow
+## Typical Workflow
 
 1. Scan your music folders (build index)
 2. Import broken playlist(s)
@@ -79,7 +82,7 @@ This tool is built for people who **organize music seriously** and rely on playl
 
 ---
 
-## 📂 Supported Playlist Format
+## Supported Playlist Format
 
 - `.m3u`
 - `.m3u8`
@@ -88,7 +91,7 @@ This tool is built for people who **organize music seriously** and rely on playl
 
 ---
 
-## 🧪 Status
+## Status
 
 - Actively developed
 - No ads
@@ -98,13 +101,34 @@ This tool is built for people who **organize music seriously** and rely on playl
 
 ---
 
-## 📄 License
+## Download (Important)
+
+⚠️ **Do NOT download the source code ZIP if you just want to use the app.**
+
+To use Playlist Fixer:
+1. Go to the **Releases** page (right side of this page)
+2. Download the **Windows portable executable (.exe)**
+3. No Python or installation required
+
+The source code is for developers only.
+
+---
+
+## Platform
+
+- **Windows:** Portable executable (no installation required)
+- **macOS:** Not available yet  
+  *(macOS build is planned, but I currently don’t have a Mac for packaging/testing)*
+
+---
+
+## License
 
 MIT License — free to use, modify, and distribute.
 
 ---
 
-## 👤 Author & Contact
+## Author & Contact
 
 **Author:** Ne  
 **GitHub:** https://github.com/Nechani  
@@ -113,3 +137,7 @@ MIT License — free to use, modify, and distribute.
 **Support:** https://ko-fi.com/nechani  
 If this tool saves you time or rescues your playlists,  
 consider supporting development ☕
+
+---
+
+For detailed usage instructions, see the documentation in the `docs/` folder.
