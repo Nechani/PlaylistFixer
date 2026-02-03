@@ -140,4 +140,4 @@ consider supporting development ☕
 
 ---
 
-For detailed usage instructions, see the documentation in the `docs/` folder.
+For detailed usage instructions, see the documentation in the `docs/` folder. (EN/JP/CH)
