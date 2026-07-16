@@ -128,16 +128,4 @@ MIT License — free to use, modify, and distribute.
 
 ---
 
-## Author & Contact
-
-**Author:** Ne  
-**GitHub:** https://github.com/Nechani  
-**Issues & feedback:** plfixne@gmail.com  
-
-**Support:** https://ko-fi.com/nechani  
-If this tool saves you time or rescues your playlists,  
-consider supporting development ☕
-
----
-
 For detailed usage instructions, see the documentation in the `docs/` folder. (EN/JP/CH)
