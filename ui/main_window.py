@@ -53,7 +53,7 @@ class MainWindow(QMainWindow):
     def __init__(self, app_data=None):
         super().__init__()
         self.app_data = app_data
-        self.setWindowTitle("Playlist Fixer v2.1.8")
+        self.setWindowTitle("Playlist Fixer v2.0")
 
         self.runner = TaskRunner()
 
@@ -514,7 +514,7 @@ class MainWindow(QMainWindow):
         # =========================
         # Info button in status bar (右下角)
         # =========================
-        self.lbl_build = QLabel("v2.1.8")
+        self.lbl_build = QLabel("v2.0")
         self.lbl_build.setToolTip("Build identifier. If this is not visible, an older copy is running.")
         self.statusBar().addPermanentWidget(self.lbl_build)
 
