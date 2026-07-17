@@ -22,6 +22,7 @@ Playlist Fixer can help when:
 - Playlists are moved between PC, Mac, and DAP devices
 - A DAP loads only part of a playlist
 - Roon exports point to paths from another computer
+- Roon forces you to export audio files together with an M3U, but you only want the playlist✨
 - A playlist contains broken, outdated, relative, or device-specific paths
 
 ---
@@ -56,30 +57,25 @@ Playlist Fixer can help when:
 
 Playlist Fixer includes dedicated handling for Roon exports.
 
-### Roon XLSX
+- Import Roon XLSX exports and rebuild them as M3U playlists
+- Parse Roon M3U relative paths
+- Match Roon exports against your existing local music library
 
-Roon XLSX exports can contain useful metadata such as:
+### 🌟 Roon XLSX Support
 
-- Title
-- Track Artist
-- Album Artist
-- Album
-- Disc number
-- Track number
-- Original path
+Roon normally exports M3U playlists together with the referenced audio files.
 
-Playlist Fixer uses this information to find matching local files even when the original absolute path belongs to another computer.
+If you only need the playlist, Playlist Fixer can use a Roon XLSX export to rebuild and export an M3U from your existing music library, without copying the audio files again.
 
-### Roon M3U
+It can also use metadata such as title, artist, album, disc number, track number, and original path to find matching files even when the XLSX came from another computer.
 
-Roon may export relative paths such as:
+### Roon M3U Support
+
+Roon M3U files may contain relative paths such as:
 
 ```text
 ../Artist/Album/1-02 Song.flac
 ```
-
-Playlist Fixer can interpret the artist, album, disc, track number, title, and path structure instead of treating the line as a normal local path only.
-
 ---
 
 ## Supported Playlist Formats
