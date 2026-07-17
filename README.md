@@ -193,14 +193,3 @@ Bug reports, unusual playlist samples, and feedback are welcome.
 ## License
 
 MIT License — free to use, modify, and distribute.
-
----
-
-## Author and Contact
-
-**Author:** Ne  
-**GitHub:** https://github.com/Nechani  
-**Issues and feedback:** plfixne@gmail.com  
-**Support:** https://ko-fi.com/nechani
-
-If Playlist Fixer saves you time or rescues a playlist you built over years, consider supporting development. ☕
