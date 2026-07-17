@@ -8,7 +8,8 @@ import csv
 
 from core.paths import stats_path as stats_path_fn
 from core.vendor.playlist_scan_safe import scan_folder
-from core.vendor.repair_playlist_safe_v4 import repair_playlist
+from core.vendor.repair_playlist_safe_v5 import repair_playlist
+from openpyxl import load_workbook
 
 ProgressCb = Callable[[int, str], None]
 
@@ -22,6 +23,79 @@ class TaskResult:
 
 class TaskRunner:
     """UI runner wiring to verified scan/repair logic."""
+
+    def _xlsx_to_m3u(self, xlsx_path: Path, out_m3u: Path) -> int:
+        """Convert a Roon XLSX export to an internal annotated M3U.
+
+        Each path is preceded by a #ROONMETA JSON comment so the repair engine can
+        use Roon metadata even when the absolute path came from another computer.
+        """
+        wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+        ws = wb.active
+
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None)
+        if not header:
+            raise ValueError("Empty xlsx")
+
+        header_map = {str(h).strip().lower(): i for i, h in enumerate(header) if h is not None}
+        if "path" not in header_map:
+            raise ValueError("XLSX missing 'Path' column")
+
+        def cell(row, *names):
+            for name in names:
+                idx = header_map.get(name.lower())
+                if idx is not None and idx < len(row):
+                    value = row[idx]
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+            return ""
+
+        lines = ["#EXTM3U", "#PLAYLISTFIXER_SOURCE:ROON_XLSX"]
+        n = 0
+        for r in rows:
+            if not r:
+                continue
+            path_value = cell(r, "Path")
+            if not path_value:
+                continue
+            meta = {
+                "source": "roon_xlsx",
+                "album_artist": cell(r, "Album Artist"),
+                "album": cell(r, "Album"),
+                "disc": cell(r, "Disc#"),
+                "track": cell(r, "Track#"),
+                "title": cell(r, "Title"),
+                "artist": cell(r, "Track Artist(s)", "Album Artist"),
+                "external_id": cell(r, "External Id"),
+            }
+            lines.append("#ROONMETA:" + json.dumps(meta, ensure_ascii=False, separators=(",", ":")))
+            lines.append(path_value)
+            n += 1
+
+        out_m3u.parent.mkdir(parents=True, exist_ok=True)
+        out_m3u.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return n
+
+    def _coerce_playlist_to_m3u(self, pl: Path, out_dir: Path) -> tuple[Path, str]:
+        """
+        Convert supported playlist inputs into a m3u path we can feed to repair engine.
+
+        - .m3u/.m3u8 : pass-through
+        - .xlsx      : convert to temp m3u with path lines (preserve order)
+        """
+        ext = pl.suffix.lower()
+        key = self.canonical_key(pl)
+
+        if ext in (".m3u", ".m3u8"):
+            return pl, pl.name
+
+        if ext == ".xlsx":
+            tmp_m3u = out_dir / f"__tmp_from_xlsx_{key}.m3u"
+            self._xlsx_to_m3u(pl, tmp_m3u)
+            return tmp_m3u, pl.name
+
+        raise ValueError(f"Unsupported playlist type: {pl.name}")
 
     # -------------------------
     # Canonical key helpers
@@ -53,6 +127,10 @@ class TaskRunner:
         key = self.canonical_key(playlist_path)
         return out_dir / f"repair_report_{key}.csv"
 
+    def session_report_path_for(self, out_dir: Path, playlist_path: Path) -> Path:
+        key = self.canonical_key(playlist_path)
+        return out_dir / f"session_repair_report_{key}.csv"
+
     def selections_path_for(self, out_dir: Path, playlist_path: Path) -> Path:
         key = self.canonical_key(playlist_path)
         return out_dir / f"selections_{key}.json"
@@ -71,27 +149,106 @@ class TaskRunner:
         progress: Optional[ProgressCb] = None,
         cancel_flag: Optional[Callable[[], bool]] = None,
     ) -> TaskResult:
+        """Incrementally scan the selected roots.
+
+        Selected roots are replaced with fresh scan results, while tracks belonging
+        to unselected roots remain in the index. Removing a root is an explicit UI
+        operation; leaving it unchecked during a scan must never delete it.
+        """
         roots = [Path(r) for r in music_roots]
         if progress:
             progress(0, "Scanning…")
 
-        items: list[dict] = []
-        stats = {"roots": [], "scanned_supported": 0, "skipped_no_duration": 0, "indexed": 0}
+        def root_key(value: object) -> str:
+            try:
+                return str(Path(str(value)).resolve()).rstrip("\\/").casefold()
+            except Exception:
+                return str(value).rstrip("\\/").casefold()
 
+        selected_keys = {root_key(r) for r in roots}
+
+        # Keep entries from roots that are not part of this scan. The selected
+        # roots will be replaced by the newly scanned results below.
+        existing_items: list[dict] = []
+        if out_index.exists():
+            try:
+                raw = json.loads(out_index.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    existing_items = [x for x in raw if isinstance(x, dict)]
+            except Exception:
+                existing_items = []
+
+        preserved_items: list[dict] = []
+        for item in existing_items:
+            item_root = item.get("root")
+            if item_root:
+                belongs_to_selected = root_key(item_root) in selected_keys
+            else:
+                # Compatibility with older indexes that did not store root.
+                item_path = root_key(item.get("path", ""))
+                belongs_to_selected = any(
+                    item_path == key or item_path.startswith(key + "\\") or item_path.startswith(key + "/")
+                    for key in selected_keys
+                )
+            if not belongs_to_selected:
+                preserved_items.append(item)
+
+        scanned_items: list[dict] = []
+        root_results: list[dict] = []
         total = max(1, len(roots))
+        scanned_supported = 0
+        skipped_no_duration = 0
+
         for idx, r in enumerate(roots):
             if cancel_flag and cancel_flag():
                 return TaskResult(False, "Scan cancelled.", {"index": None})
             if progress:
-                progress(int(idx * 100 / total), f"Scanning: {r} | indexed so far: {len(items)}")
+                progress(
+                    int(idx * 100 / total),
+                    f"Scanning: {r} | indexed this scan: {len(scanned_items)} | total retained: {len(preserved_items)}",
+                )
 
             res = scan_folder(r)
-            items.extend(res.get("items", []))
-            stats["roots"].append(res.get("root", str(r)))
-            stats["scanned_supported"] += int(res.get("scanned_supported", 0))
-            stats["skipped_no_duration"] += int(res.get("skipped_no_duration", 0))
+            result_root = str(res.get("root", r))
+            root_results.append({
+                "root": result_root,
+                "scanned_supported": int(res.get("scanned_supported", 0) or 0),
+                "skipped_no_duration": int(res.get("skipped_no_duration", 0) or 0),
+                "indexed": int(res.get("indexed", 0) or 0),
+            })
+            scanned_items.extend(res.get("items", []))
+            scanned_supported += int(res.get("scanned_supported", 0) or 0)
+            skipped_no_duration += int(res.get("skipped_no_duration", 0) or 0)
 
-        stats["indexed"] = len(items)
+        items = preserved_items + scanned_items
+
+        # Rebuild aggregate metadata from the final merged index so the stats file
+        # describes the full library, not merely the roots scanned this time.
+        ext_counts: dict[str, int] = {}
+        final_roots: list[str] = []
+        seen_roots: set[str] = set()
+        for item in items:
+            ext = str(item.get("ext") or Path(str(item.get("path", ""))).suffix).lower()
+            if ext:
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            item_root = item.get("root")
+            if item_root:
+                key = root_key(item_root)
+                if key not in seen_roots:
+                    seen_roots.add(key)
+                    final_roots.append(str(item_root))
+
+        stats = {
+            "roots": final_roots,
+            "scanned_supported": scanned_supported,
+            "skipped_no_duration": skipped_no_duration,
+            "indexed": len(items),
+            "available_exts": sorted(ext_counts.keys()),
+            "ext_counts": ext_counts,
+            "last_scan_roots": [str(r) for r in roots],
+            "last_scan_indexed": len(scanned_items),
+            "preserved_indexed": len(preserved_items),
+        }
 
         out_index.parent.mkdir(parents=True, exist_ok=True)
         out_index.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -101,8 +258,19 @@ class TaskRunner:
         sp.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
         if progress:
-            progress(100, f"Scan complete. Indexed: {stats['indexed']}")
-        return TaskResult(True, f"Scan complete. Indexed: {stats['indexed']}", {"index": str(out_index), "stats": str(sp)})
+            progress(100, f"Scan complete. Added/updated: {len(scanned_items)} | Total indexed: {len(items)}")
+        return TaskResult(
+            True,
+            f"Scan complete. Added/updated: {len(scanned_items)} | Total indexed: {len(items)}",
+            {
+                "index": str(out_index),
+                "stats": str(sp),
+                "root_results": root_results,
+                "scan_indexed": len(scanned_items),
+                "total_indexed": len(items),
+                "preserved_indexed": len(preserved_items),
+            },
+        )
 
     # -------------------------
     # Report helpers
@@ -275,6 +443,11 @@ class TaskRunner:
         dry_run: bool = False,
         progress: Optional[ProgressCb] = None,
         cancel_flag: Optional[Callable[[], bool]] = None,
+        format_mode: str = "none",
+        strict_ext: Optional[str] = None,
+        format_priority_list: Optional[List[str]] = None,
+        enabled_roots: Optional[List[Path]] = None,
+        session_reports: bool = False,
     ) -> TaskResult:
         """
         Repair(Safe):
@@ -282,6 +455,26 @@ class TaskRunner:
         - Does NOT keep auto-generated fixed playlist file (tmp file deleted).
         """
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        repair_index_path = index_path
+        filtered_index_path: Optional[Path] = None
+        if enabled_roots:
+            roots = [str(Path(r)).rstrip("\\/").lower() for r in enabled_roots]
+            try:
+                items = json.loads(index_path.read_text(encoding="utf-8"))
+                filtered = []
+                for item in items if isinstance(items, list) else []:
+                    item_path = str(item.get("path", ""))
+                    item_root = str(item.get("root", ""))
+                    probe = item_root or item_path
+                    norm = probe.rstrip("\\/").lower()
+                    if any(norm == root or norm.startswith(root + "\\") or norm.startswith(root + "/") for root in roots):
+                        filtered.append(item)
+                filtered_index_path = out_dir / "__active_music_index.json"
+                filtered_index_path.write_text(json.dumps(filtered, ensure_ascii=False, indent=2), encoding="utf-8")
+                repair_index_path = filtered_index_path
+            except Exception as e:
+                raise ValueError(f"Could not filter index by selected music roots: {e}")
 
         summaries: list[dict] = []
         all_amb: list[dict] = []
@@ -296,11 +489,30 @@ class TaskRunner:
             if progress:
                 progress(pct, f"Repairing: {pl.name}")
 
+            m3u_in, _ = self._coerce_playlist_to_m3u(pl, out_dir)
+
             key = self.canonical_key(pl)
             tmp_fixed = out_dir / f"__tmp_fixed_{key}.m3u"
-            report_path = self.report_path_for(out_dir, pl)
+            report_path = (self.session_report_path_for(out_dir, pl)
+                           if session_reports else self.report_path_for(out_dir, pl))
 
-            s = repair_playlist(str(pl), str(index_path), str(tmp_fixed), str(report_path), verbose=False)
+            s = repair_playlist(
+                str(m3u_in),
+                str(repair_index_path),
+                str(tmp_fixed),
+                str(report_path),
+                verbose=False,
+                format_mode=format_mode,
+                strict_ext=strict_ext,
+                format_priority_list=format_priority_list,
+            )
+           
+            # 清 tmp_xlsx 轉出來的 m3u
+            try:
+                if m3u_in.name.startswith("__tmp_from_xlsx_") and m3u_in.exists():
+                    m3u_in.unlink()
+            except Exception:
+                pass
             summaries.append(s)
 
             # remove tmp output playlist
@@ -316,6 +528,11 @@ class TaskRunner:
                 all_amb.extend(amb)
                 all_fail.extend(fail)
 
+        if filtered_index_path is not None:
+            try:
+                filtered_index_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         if progress:
             progress(100, "Repair complete.")
         return TaskResult(

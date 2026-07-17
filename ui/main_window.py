@@ -3,9 +3,13 @@ from __future__ import annotations
 import os
 import re
 import json
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal, QObject, Slot, Qt
+from openpyxl import load_workbook
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QFileDialog, QMessageBox, QCheckBox, QComboBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -15,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.runner import TaskRunner, TaskResult
-from core.paths import index_path, reports_dir, settings_path
+from core.paths import index_path, reports_dir, settings_path, stats_path
 
 
 class Worker(QObject):
@@ -49,11 +53,11 @@ class MainWindow(QMainWindow):
     def __init__(self, app_data=None):
         super().__init__()
         self.app_data = app_data
-        self.setWindowTitle("Playlist Fixer")
+        self.setWindowTitle("Playlist Fixer v2.1.8")
 
         self.runner = TaskRunner()
 
-        self.music_roots: list[Path] = []
+        self.music_roots: list[dict] = []
         self.playlists: list[Path] = []
 
         self.index_path = index_path()
@@ -79,6 +83,7 @@ class MainWindow(QMainWindow):
         self._session_repaired_keys: set[str] = set()
         
         self._saved_keys: set[str] = set()
+        self._persisted_progress_keys: set[str] = set()
 
         self._active_target: str | None = None   # "AMBIGUOUS" | "FAILED"
         self._active_pl_key: str | None = None
@@ -97,6 +102,8 @@ class MainWindow(QMainWindow):
         self._view_mode: str = "UNRESOLVED"
 
         self._build_ui()
+        self._load_music_roots()
+        self._prune_saved_roots_against_index()
         self._refresh_music_roots_ui()
 
     # ---------- persistence ----------
@@ -123,22 +130,166 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Save failed", f"Could not save selections:\n{p}\n\n{e}")
 
+    def _progress_file_for_key(self, pl_key: str) -> Path:
+        return self.reports_path / f"progress_{pl_key}.json"
+
+    @staticmethod
+    def _normalized_playlist_path(path: Path) -> str:
+        try:
+            return str(Path(path).resolve(strict=False)).casefold()
+        except Exception:
+            return str(Path(path).absolute()).casefold()
+
+    def _has_saved_progress(self, pl_key: str, playlist: Path) -> bool:
+        """Return True only for the exact saved output playlist.
+
+        Progress files may share a canonical name with the original playlist, but
+        the marker records the exact fixed playlist path that was saved. This
+        prevents an untouched source playlist with the same base name from
+        inheriting the fixed playlist's repair state.
+        """
+        progress = self._progress_file_for_key(pl_key)
+        report = self.reports_path / f"repair_report_{pl_key}.csv"
+        if not (progress.exists() and report.exists()):
+            return False
+        try:
+            data = json.loads(progress.read_text(encoding="utf-8"))
+            saved_path = data.get("saved_playlist") or data.get("source_playlist")
+            if not saved_path:
+                return False
+            return self._normalized_playlist_path(Path(saved_path)) == self._normalized_playlist_path(playlist)
+        except Exception:
+            return False
+
+    def _write_progress_marker(self, pl_key: str, saved_playlist: Path, source_playlist: Path) -> None:
+        p = self._progress_file_for_key(pl_key)
+        data = {
+            "version": 2,
+            "playlist_key": pl_key,
+            "saved_playlist": str(saved_playlist),
+            "source_playlist": str(source_playlist),
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _session_report_for(self, playlist: Path) -> Path:
+        return self.runner.session_report_path_for(self.reports_path, playlist)
+
+    def _settings_file(self) -> Path:
+        # Keep user preferences outside the extracted program folder so an
+        # update/re-extract does not erase saved Music Roots.
+        if self.app_data:
+            return Path(self.app_data) / "settings.json"
+        return settings_path()
+
     def _load_settings(self) -> dict:
-        p = settings_path()
+        p = self._settings_file()
+
+        # One-time migration from builds that stored settings beside app.py.
+        legacy = settings_path()
+        if not p.exists() and legacy.exists() and legacy != p:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception:
+                pass
+
         if not p.exists():
             return {}
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
 
     def _save_settings(self, data: dict) -> None:
-        p = settings_path()
+        p = self._settings_file()
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(self, "Settings not saved", f"Could not save settings to:\n{p}\n\n{e}")
+
+
+    def _load_music_roots(self) -> None:
+        settings = self._load_settings()
+        raw = settings.get("music_roots", [])
+        roots: list[dict] = []
+        if isinstance(raw, list):
+            for entry in raw:
+                if isinstance(entry, str):
+                    roots.append({"path": entry, "enabled": True, "imported": True})
+                elif isinstance(entry, dict) and entry.get("path"):
+                    roots.append({
+                        "path": str(entry["path"]),
+                        "enabled": bool(entry.get("enabled", True)),
+                        # Anything already persisted by an older build is treated as
+                        # imported initially, then verified against index stats below.
+                        "imported": bool(entry.get("imported", True)),
+                    })
+        self.music_roots = roots
+
+    def _indexed_root_paths(self) -> set[str]:
+        p = stats_path()
+        if not p.exists():
+            return set()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            roots = data.get("roots", []) if isinstance(data, dict) else []
+            return {str(Path(x)) for x in roots if x}
         except Exception:
-            pass
+            return set()
+
+    def _prune_saved_roots_against_index(self) -> None:
+        """Remove stale roots that were persisted but never made it into an index.
+
+        Music Roots represent folders actually imported into the music database,
+        not merely folders that were once selected in a file dialog.
+        """
+        indexed = self._indexed_root_paths()
+        before = len(self.music_roots)
+        if indexed:
+            self.music_roots = [
+                r for r in self.music_roots
+                if str(Path(r.get("path", ""))) in indexed
+            ]
+        else:
+            # No usable index means there are no confirmed imported roots yet.
+            self.music_roots = []
+        if len(self.music_roots) != before:
+            self._save_music_roots()
+
+    def _save_music_roots(self) -> None:
+        settings = self._load_settings()
+        # Pending folders are session-only. Persist only folders that have
+        # successfully contributed at least one track to an index.
+        settings["music_roots"] = [
+            {"path": r["path"], "enabled": bool(r.get("enabled", True)), "imported": True}
+            for r in self.music_roots if r.get("imported", False)
+        ]
+        self._save_settings(settings)
+
+    def _enabled_music_roots(self) -> list[Path]:
+        return [Path(r["path"]) for r in self.music_roots if r.get("enabled", True)]
+
+    def on_music_root_item_changed(self, item: QListWidgetItem) -> None:
+        raw = item.data(Qt.UserRole)
+        if not raw:
+            return
+        for entry in self.music_roots:
+            if entry.get("path") == str(raw):
+                entry["enabled"] = item.checkState() == Qt.Checked
+                break
+        self._save_music_roots()
+        self._update_music_roots_label()
+
+    def _update_music_roots_label(self) -> None:
+        enabled = sum(1 for r in self.music_roots if r.get("enabled", True))
+        imported = sum(1 for r in self.music_roots if r.get("imported", False))
+        pending = len(self.music_roots) - imported
+        suffix = f" / Pending: {pending}" if pending else ""
+        self.lbl_music_roots.setText(f"Enabled: {enabled} / Imported: {imported}{suffix}")
 
     # ---------- tiny helpers ----------
     def _is_exported_playlist(self, pl: Path) -> bool:
@@ -160,7 +311,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Information)
         box.setWindowTitle("Imported")
-        box.setText("Playlists imported.")
+        box.setText("Playlists imported. Songs are listed as Not repaired until you run Repair (Safe).")
         box.setCheckBox(chk)
         box.exec()
 
@@ -183,6 +334,7 @@ class MainWindow(QMainWindow):
             getattr(self, "btn_remove_music", None),
             getattr(self, "btn_clear_music", None),
             getattr(self, "btn_scan", None),
+            getattr(self, "btn_rescan", None),
             getattr(self, "btn_import_pl", None),
             getattr(self, "btn_repair_safe", None),
             getattr(self, "btn_open_reports", None),
@@ -219,7 +371,7 @@ class MainWindow(QMainWindow):
         # =========================
         # Music roots panel
         # =========================
-        roots_box = QGroupBox("Music Roots (folders to scan)")
+        roots_box = QGroupBox("Music Roots (checked = Repair scope)")
         roots_l = QVBoxLayout(roots_box)
 
         roots_btn_row = QHBoxLayout()
@@ -233,9 +385,10 @@ class MainWindow(QMainWindow):
 
         self.lst_music_roots = QListWidget()
         self.lst_music_roots.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.lst_music_roots.itemChanged.connect(self.on_music_root_item_changed)
         roots_l.addWidget(self.lst_music_roots)
 
-        self.lbl_music_roots = QLabel("Selected: 0")
+        self.lbl_music_roots = QLabel("Enabled: 0 / Imported: 0")
         self.lbl_music_roots.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         roots_l.addWidget(self.lbl_music_roots)
 
@@ -243,8 +396,10 @@ class MainWindow(QMainWindow):
         # Fixed controls area (rows)
         # =========================
         row_scan = QHBoxLayout()
-        self.btn_scan = QPushButton("Scan / Rebuild Index")
+        self.btn_scan = QPushButton("Scan New Folders")
+        self.btn_rescan = QPushButton("Rescan Selected")
         row_scan.addWidget(self.btn_scan)
+        row_scan.addWidget(self.btn_rescan)
 
         row2 = QHBoxLayout()
         self.btn_import_pl = QPushButton("Import Playlist(s)")
@@ -294,7 +449,7 @@ class MainWindow(QMainWindow):
         # =========================
         # Panes (Ambiguous / Candidates / Failed)
         # =========================
-        boxA = QGroupBox("AMBIGUOUS (select row → choose candidate → Apply → Save)")
+        boxA = QGroupBox("UNRESOLVED / AMBIGUOUS (select row → choose candidate → Apply → Save)")
         boxA_l = QVBoxLayout(boxA)
         self.tbl_amb = QTableWidget(0, 4)
         self.tbl_amb.setHorizontalHeaderLabels(["Playlist", "EXTINF", "Original Path", "Notes"])
@@ -359,6 +514,10 @@ class MainWindow(QMainWindow):
         # =========================
         # Info button in status bar (右下角)
         # =========================
+        self.lbl_build = QLabel("v2.1.8")
+        self.lbl_build.setToolTip("Build identifier. If this is not visible, an older copy is running.")
+        self.statusBar().addPermanentWidget(self.lbl_build)
+
         self.btn_info = QPushButton("ⓘ")
         self.btn_info.setToolTip("About / Links")
         self.btn_info.setFixedWidth(32)
@@ -372,6 +531,7 @@ class MainWindow(QMainWindow):
         self.btn_clear_music.clicked.connect(self.on_clear_music_roots)
 
         self.btn_scan.clicked.connect(self.on_scan_index)
+        self.btn_rescan.clicked.connect(self.on_rescan_selected)
         self.btn_import_pl.clicked.connect(self.on_import_playlists)
         self.btn_repair_safe.clicked.connect(self.on_repair_safe)
         self.btn_open_reports.clicked.connect(self.on_open_reports)
@@ -391,26 +551,157 @@ class MainWindow(QMainWindow):
         self.btn_info.clicked.connect(self.on_about)
 
     def _refresh_music_roots_ui(self):
+        self.lst_music_roots.blockSignals(True)
         self.lst_music_roots.clear()
-        for p in self.music_roots:
-            it = QListWidgetItem(str(p))
-            it.setData(Qt.UserRole, str(p))
+        for entry in self.music_roots:
+            path = str(entry.get("path", ""))
+            available = Path(path).exists()
+            imported = bool(entry.get("imported", False))
+            if not imported:
+                suffix = "  [Pending scan]"
+            elif not available:
+                suffix = "  [Unavailable]"
+            else:
+                suffix = ""
+            it = QListWidgetItem(path + suffix)
+            it.setData(Qt.UserRole, path)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if entry.get("enabled", True) else Qt.Unchecked)
+            if not imported:
+                it.setToolTip("This folder is temporary until Scan New Folders successfully indexes at least one track.")
+            elif not available:
+                it.setToolTip("This imported folder is currently unavailable.")
             self.lst_music_roots.addItem(it)
-        self.lbl_music_roots.setText(f"Selected: {len(self.music_roots)}")
+        self.lst_music_roots.blockSignals(False)
+        self._update_music_roots_label()
+
+    def _read_playlist_text(self, playlist: Path) -> str:
+        """Read text playlists without silently turning a wrong encoding into mojibake."""
+        raw = playlist.read_bytes()
+        encodings = ("utf-8-sig", "utf-8", "utf-16", "cp950", "big5", "cp1252")
+        for encoding in encodings:
+            try:
+                return raw.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        # Last resort: keep the file importable while clearly replacing only undecodable bytes.
+        return raw.decode("utf-8", errors="replace")
+
+    def _parse_xlsx_entries(self, playlist: Path) -> list[dict]:
+        """Parse a Roon XLSX export for the pre-repair preview."""
+        wb = load_workbook(playlist, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            rows = ws.iter_rows(values_only=True)
+            header = next(rows, None)
+            if not header:
+                return []
+            header_map = {str(h).strip().lower(): i for i, h in enumerate(header) if h is not None}
+            path_idx = header_map.get("path")
+            if path_idx is None:
+                raise ValueError("XLSX missing 'Path' column")
+
+            # Use Roon metadata when present; otherwise fall back to the filename.
+            title_idx = next((header_map[k] for k in ("title", "track title", "name") if k in header_map), None)
+            artist_idx = next((header_map[k] for k in ("artist", "track artist", "artists") if k in header_map), None)
+            entries: list[dict] = []
+            for row in rows:
+                if not row:
+                    continue
+                value = row[path_idx] if path_idx < len(row) else None
+                original_path = str(value).strip() if value is not None else ""
+                if not original_path:
+                    continue
+                title = str(row[title_idx]).strip() if title_idx is not None and title_idx < len(row) and row[title_idx] is not None else ""
+                artist = str(row[artist_idx]).strip() if artist_idx is not None and artist_idx < len(row) and row[artist_idx] is not None else ""
+                display = " - ".join(part for part in (artist, title) if part) or Path(original_path).stem
+                entries.append({
+                    "playlist": str(playlist),
+                    "pl_key": self.runner.canonical_key(playlist),
+                    "row_index": str(len(entries)),
+                    "extinf_display": display,
+                    "original_path": original_path,
+                    "notes": "[NOT REPAIRED]",
+                    "candidates": [],
+                })
+            return entries
+        finally:
+            wb.close()
+
+    def _parse_playlist_entries(self, playlist: Path) -> list[dict]:
+        if playlist.suffix.lower() == ".xlsx":
+            return self._parse_xlsx_entries(playlist)
+
+        text = self._read_playlist_text(playlist)
+        lines = text.splitlines()
+        entries: list[dict] = []
+        pending_extinf = ""
+        for line in lines:
+            stripped = line.strip().lstrip("\ufeff")
+            if not stripped:
+                continue
+            if stripped.upper().startswith("#EXTINF"):
+                pending_extinf = stripped
+                continue
+            if stripped.startswith("#"):
+                continue
+            display = pending_extinf
+            if "," in pending_extinf:
+                display = pending_extinf.split(",", 1)[1].strip()
+            entries.append({
+                "playlist": str(playlist),
+                "pl_key": self.runner.canonical_key(playlist),
+                "row_index": str(len(entries)),
+                "extinf_display": display or Path(stripped).stem,
+                "original_path": stripped,
+                "notes": "[NOT REPAIRED]",
+                "candidates": [],
+            })
+            pending_extinf = ""
+        return entries
 
     # ---------- view building ----------
     def _reload_reports_cache(self) -> None:
-        """Read repair_report_*.csv for current playlists into memory cache."""
+        """Load only active session reports or explicitly saved progress.
+
+        Repair output is provisional until Save. A provisional report must not
+        reappear after importing another playlist or restarting the app.
+        """
         self._report_rows_by_key = {}
+        self._persisted_progress_keys = set()
         self.reports_path.mkdir(parents=True, exist_ok=True)
 
         for pl in self.playlists:
             pl_key = self.runner.canonical_key(pl)
-            report_csv = self.runner.report_path_for(self.reports_path, pl)
-            if not report_csv.exists():
+            report_csv = None
+            if pl_key in self._session_repaired_keys:
+                candidate = self._session_report_for(pl)
+                if candidate.exists():
+                    report_csv = candidate
+            elif self._has_saved_progress(pl_key, pl):
+                candidate = self.runner.report_path_for(self.reports_path, pl)
+                if candidate.exists():
+                    report_csv = candidate
+                    self._persisted_progress_keys.add(pl_key)
+
+            if report_csv is None:
                 continue
             rows = self.runner._read_report_rows(report_csv)
             if rows:
+                # Path-only M3U and Roon XLSX reports do not contain EXTINF text.
+                # Reuse the imported playlist preview by row index so Resolved still
+                # identifies each song instead of showing an empty title column.
+                try:
+                    preview = {str(r.get("row_index", "")): r for r in self._parse_playlist_entries(pl)}
+                except Exception:
+                    preview = {}
+                for rr in rows:
+                    idx = str(rr.get("row_index", rr.get("_i", "")))
+                    src = preview.get(idx, {})
+                    if not self._safe_str(rr.get("extinf_display")):
+                        rr["extinf_display"] = self._safe_str(src.get("extinf_display"))
+                    if not self._safe_str(rr.get("original_path")):
+                        rr["original_path"] = self._safe_str(src.get("original_path"))
                 self._report_rows_by_key[pl_key] = rows
 
     def _build_unresolved_rows(self) -> tuple[list[dict], list[dict]]:
@@ -421,12 +712,17 @@ class MainWindow(QMainWindow):
             pl_key = self.runner.canonical_key(pl)
 
             is_exported = self._is_exported_playlist(pl)
-
-            # ✅ 原始歌單：預設不吃「磁碟舊 report」
-            if (not is_exported) and (pl_key not in self._session_repaired_keys):
-                continue
+            has_saved_progress = pl_key in self._persisted_progress_keys
 
             report_rows = self._report_rows_by_key.get(pl_key, [])
+
+            # Before Repair, always show the imported file itself when there is no usable
+            # report in this session. This also covers fixed_*_selected.m3u files imported
+            # as a new input instead of treating them as invisible historical progress.
+            if pl_key not in self._session_repaired_keys and not has_saved_progress:
+                amb_all.extend(self._parse_playlist_entries(pl))
+                continue
+
             if not report_rows:
                 continue
 
@@ -434,7 +730,7 @@ class MainWindow(QMainWindow):
             # disk_sel: 以前 Save 過、寫在磁碟上的 selections（永遠視為已完成）
             # mem_sel : 本次 session Apply 但尚未 Save 的 selections
             disk_sel: dict[str, str] = {}
-            if is_exported:
+            if has_saved_progress:
                 disk_sel = self._load_selections_for_key(pl_key) or {}
 
             mem_sel: dict[str, str] = self._selections_by_key.get(pl_key, {}) or {}
@@ -468,7 +764,7 @@ class MainWindow(QMainWindow):
 
             # ✅ 把 merged 保存回記憶體（避免你匯入 exported 後，disk_sel 覆蓋掉本次 Apply 的 mem_sel）
             #    但注意：原始歌單你原本的設計是「不吃 disk」，所以這裡只有 exported 才會 merge disk
-            if is_exported and merged_sel:
+            if has_saved_progress and merged_sel:
                 self._selections_by_key[pl_key] = merged_sel
 
             amb_all.extend(amb)
@@ -513,14 +809,14 @@ class MainWindow(QMainWindow):
         for pl in self.playlists:
             pl_key = self.runner.canonical_key(pl)
 
-            is_exported = self._is_exported_playlist(pl)
+            has_saved_progress = pl_key in self._persisted_progress_keys
 
-            # ✅ E-1: 原始歌單，且這次 session 沒跑 repair -> 不顯示任何舊 resolved
-            if (not is_exported) and (pl_key not in self._session_repaired_keys):
+            # Show resolved rows only for this session's provisional Repair or
+            # for progress that was explicitly committed with Save.
+            if pl_key not in self._session_repaired_keys and not has_saved_progress:
                 continue
 
-            # ✅ E-2: exported 才允許從 disk 讀 selections；原始只用 mem selections
-            disk_sel = self._load_selections_for_key(pl_key) if is_exported else {}
+            disk_sel = self._load_selections_for_key(pl_key) if has_saved_progress else {}
             mem_sel = self._selections_by_key.get(pl_key, {}) or {}
             selections = {**disk_sel, **mem_sel}
 
@@ -541,7 +837,7 @@ class MainWindow(QMainWindow):
                 after = selections.get(row_index, "").strip() if manual else (written or orig)
 
                 # resolved 판단: manual exists OR report itself says resolved OR has a written/picked path
-                auto_resolved = (status in RESOLVED_STATUSES)
+                auto_resolved = any(k in status for k in RESOLVED_STATUSES)
                 is_resolved = manual or auto_resolved
                 if not is_resolved:
                     continue
@@ -624,13 +920,15 @@ class MainWindow(QMainWindow):
             return
         p = Path(folder)
 
-        if p in self.music_roots:
+        if any(Path(r.get("path", "")) == p for r in self.music_roots):
             self.status_label.setText(f"Already added: {folder}")
             return
 
-        self.music_roots.append(p)
+        self.music_roots.append({"path": str(p), "enabled": True, "imported": False})
+        # Do not persist yet. A folder becomes permanent only after a scan
+        # successfully imports at least one track from it.
         self._refresh_music_roots_ui()
-        self.status_label.setText(f"Added: {folder}")
+        self.status_label.setText(f"Pending scan: {folder}")
 
     def on_remove_music_roots(self):
         items = self.lst_music_roots.selectedItems()
@@ -641,12 +939,13 @@ class MainWindow(QMainWindow):
         for it in items:
             raw = it.data(Qt.UserRole)
             if raw:
-                to_remove.add(Path(str(raw)))
+                to_remove.add(str(raw))
 
         if not to_remove:
             return
 
-        self.music_roots = [p for p in self.music_roots if p not in to_remove]
+        self.music_roots = [r for r in self.music_roots if str(r.get("path", "")) not in to_remove]
+        self._save_music_roots()
         self._refresh_music_roots_ui()
         self.status_label.setText(f"Removed: {len(to_remove)} folder(s)")
 
@@ -654,24 +953,95 @@ class MainWindow(QMainWindow):
         if not self.music_roots:
             return
         self.music_roots = []
+        self._save_music_roots()
         self._refresh_music_roots_ui()
         self.status_label.setText("Cleared all music folders")
 
     def on_scan_index(self):
+        """Import only folders that have not yet been indexed.
+
+        Checkboxes remain Repair-scope controls. Existing imported roots are
+        deliberately skipped so adding one new folder never rescans a large
+        established library.
+        """
         if self._busy:
             QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
             return
-        if not self.music_roots:
-            QMessageBox.warning(self, "No folder", "Please add at least one music folder first.")
+
+        scan_roots = [Path(r["path"]) for r in self.music_roots if not r.get("imported", False)]
+        if not scan_roots:
+            QMessageBox.information(
+                self,
+                "No new folders",
+                "There are no Pending scan folders.\n\n"
+                "Use Rescan Selected only when you intentionally want to refresh an existing folder.",
+            )
             return
-        self._run_task(self.runner.scan_index, music_roots=self.music_roots, out_index=self.index_path)
+
+        missing = [str(p) for p in scan_roots if not p.exists()]
+        if missing:
+            QMessageBox.warning(self, "Unavailable folder", "These new folders are unavailable:\n" + "\n".join(missing))
+            return
+
+        self.status_label.setText(f"Scanning {len(scan_roots)} new folder(s)…")
+        self._run_task(self.runner.scan_index, music_roots=scan_roots, out_index=self.index_path)
+
+    def on_rescan_selected(self):
+        """Explicitly refresh imported roots selected by row highlight.
+
+        Row selection controls this operation; checkbox state still controls
+        Repair scope and is intentionally ignored here.
+        """
+        if self._busy:
+            QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
+            return
+
+        selected_paths = {
+            str(item.data(Qt.UserRole))
+            for item in self.lst_music_roots.selectedItems()
+            if item.data(Qt.UserRole)
+        }
+        scan_roots = [
+            Path(r["path"])
+            for r in self.music_roots
+            if r.get("imported", False) and str(r.get("path", "")) in selected_paths
+        ]
+        if not scan_roots:
+            QMessageBox.information(
+                self,
+                "Select imported folder",
+                "Highlight one or more already imported folders in the list, then choose Rescan Selected.\n\n"
+                "The checkbox is only for Repair scope.",
+            )
+            return
+
+        missing = [str(p) for p in scan_roots if not p.exists()]
+        if missing:
+            QMessageBox.warning(self, "Unavailable folder", "These selected folders are unavailable:\n" + "\n".join(missing))
+            return
+
+        names = "\n".join(str(p) for p in scan_roots)
+        answer = QMessageBox.question(
+            self,
+            "Rescan selected folders?",
+            "This will reread and replace the existing index entries for:\n\n"
+            + names
+            + "\n\nOther imported folders will remain unchanged.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        self.status_label.setText(f"Rescanning {len(scan_roots)} selected folder(s)…")
+        self._run_task(self.runner.scan_index, music_roots=scan_roots, out_index=self.index_path)
 
     def on_import_playlists(self):
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select playlist(s)",
             "",
-            "Playlists (*.m3u *.m3u8);;All files (*.*)"
+            "Playlists (*.m3u *.m3u8 *.xlsx);;M3U playlists (*.m3u *.m3u8);;Roon Excel exports (*.xlsx);;All files (*.*)"
         )
         if not files:
             return
@@ -695,15 +1065,18 @@ class MainWindow(QMainWindow):
         if not self.playlists:
             QMessageBox.warning(self, "No playlist", "Please import playlist(s) first.")
             return
+        enabled_roots = self._enabled_music_roots()
+        if not enabled_roots:
+            QMessageBox.warning(self, "No music root", "Please enable at least one music folder before Repair.")
+            return
         if not self.index_path.exists():
-            QMessageBox.warning(self, "No index", f"Index not found: {self.index_path}\nPlease Scan / Rebuild Index first.")
+            QMessageBox.warning(self, "No index", f"Index not found: {self.index_path}\nPlease use Scan New Folders first.")
             return
 
         # 防呆：避免誤按 Repair 覆寫 report
         has_any_report = any(
-            self.runner.report_path_for(self.reports_path, pl).exists()
+            self._has_saved_progress(self.runner.canonical_key(pl), pl)
             for pl in self.playlists
-            if self._is_exported_playlist(pl)  # 只有 exported 才算「進度」
         )
 
         if has_any_report:
@@ -711,26 +1084,28 @@ class MainWindow(QMainWindow):
             box.setIcon(QMessageBox.Question)
             box.setWindowTitle("Repair report exists")
             box.setText(
-                "A repair report already exists.\n\n"
-                "If you re-run Repair, the report may be overwritten and your remaining list may change.\n\n"
+                "Saved repair progress already exists.\n\n"
+                "Resume keeps that saved progress. Re-run creates a provisional new result; "
+                "the saved progress is not replaced unless you press Save.\n\n"
                 "What do you want to do?"
             )
 
             btn_resume = box.addButton("Resume (load existing report)", QMessageBox.AcceptRole)
-            btn_rerun = box.addButton("Re-run Repair (overwrite report)", QMessageBox.DestructiveRole)
+            btn_rerun = box.addButton("Re-run Repair (provisional)", QMessageBox.DestructiveRole)
             btn_cancel = box.addButton("Cancel", QMessageBox.RejectRole)
 
             box.exec()
             clicked = box.clickedButton()
 
             if clicked == btn_resume:
+                self._session_repaired_keys = set()
                 self._reload_reports_cache()
                 self._refresh_tables_from_mode()
-                self.status_label.setText("Resumed from existing report.")
+                self.status_label.setText("Resumed from saved progress.")
                 return
             if clicked == btn_cancel:
                 return
-            # clicked == btn_rerun -> continue and overwrite
+            # clicked == btn_rerun -> create a provisional session report
 
         # clear UI before repair
         self._ambiguous_rows = []
@@ -753,6 +1128,8 @@ class MainWindow(QMainWindow):
             out_dir=self.reports_path,
             mode="safe",
             dry_run=False,
+            enabled_roots=enabled_roots,
+            session_reports=True,
         )
 
     def on_open_reports(self):
@@ -840,7 +1217,12 @@ class MainWindow(QMainWindow):
 
         for pl in self.playlists:
             pl_key = self.runner.canonical_key(pl)
-            report_csv = self.runner.report_path_for(self.reports_path, pl)
+            if pl_key in self._session_repaired_keys:
+                report_csv = self._session_report_for(pl)
+            elif self._has_saved_progress(pl_key, pl):
+                report_csv = self.runner.report_path_for(self.reports_path, pl)
+            else:
+                continue
             if not report_csv.exists():
                 continue
 
@@ -851,10 +1233,15 @@ class MainWindow(QMainWindow):
             pending_keys.append(pl_key)
 
         if not jobs:
-            QMessageBox.critical(self, "Missing report", "No repair_report_*.csv found.\nRun Repair (Safe) first.")
+            QMessageBox.critical(self, "Missing report", "No active Repair result or saved progress was found.\nRun Repair (Safe) first.")
             return
 
         self._pending_save_keys = pending_keys
+        self._pending_save_sources = {self.runner.canonical_key(pl): pl for pl in self.playlists}
+        self._pending_save_outputs = {
+            self.runner.canonical_key(pl): self.runner.export_path_for(self.reports_path, pl)
+            for pl in self.playlists
+        }
         self._last_action = "SAVE"
         self._run_task(self.runner.export_fixed_multi, jobs=jobs)
     
@@ -1037,6 +1424,51 @@ class MainWindow(QMainWindow):
             self.status_label.setText(result.message or "Done")
             outs = result.outputs or {}
 
+            # Scan result: persist only roots that actually contributed tracks.
+            if "root_results" in outs:
+                results = outs.get("root_results", []) or []
+                scanned_paths = {str(Path(r.get("root", ""))) for r in results if r.get("root")}
+                successful = {
+                    str(Path(r.get("root", "")))
+                    for r in results
+                    if r.get("root") and int(r.get("indexed", 0) or 0) > 0
+                }
+
+                kept: list[dict] = []
+                for entry in self.music_roots:
+                    key = str(Path(entry.get("path", "")))
+                    if key in scanned_paths:
+                        if key in successful:
+                            entry["imported"] = True
+                            kept.append(entry)
+                        # Scanned but indexed zero: remove automatically.
+                    else:
+                        # Disabled roots were not part of this rebuild. Keep only
+                        # roots that had already been confirmed by an earlier scan.
+                        if entry.get("imported", False):
+                            kept.append(entry)
+
+                self.music_roots = kept
+                self._save_music_roots()
+                self._refresh_music_roots_ui()
+
+                rejected = len(scanned_paths - successful)
+                scan_indexed = int(outs.get("scan_indexed", 0) or 0)
+                total_indexed = int(outs.get("total_indexed", scan_indexed) or 0)
+                preserved_indexed = int(outs.get("preserved_indexed", 0) or 0)
+                self.scan_count_label.setText(f"Indexed: {total_indexed}")
+                msg = (
+                    f"Scan complete. Added/updated roots: {len(successful)}; "
+                    f"tracks scanned: {scan_indexed}; total library: {total_indexed}"
+                )
+                if preserved_indexed:
+                    msg += f"; retained from other indexed roots: {preserved_indexed}"
+                if rejected:
+                    msg += f"; removed empty/unreadable selected roots: {rejected}"
+                self.status_label.setText(msg)
+                QMessageBox.information(self, "Scan Complete", msg)
+                return
+
             # Repair result
             if "ambiguous" in outs or "failed" in outs:
                 # After repair, reports on disk changed -> reload cache then refresh current view
@@ -1068,10 +1500,23 @@ class MainWindow(QMainWindow):
             if "done" in outs:
                 if getattr(self, "_last_action", None) == "SAVE":
                     for pl_key in getattr(self, "_pending_save_keys", []) or []:
+                        source = getattr(self, "_pending_save_sources", {}).get(pl_key)
+                        if source is not None:
+                            session_report = self._session_report_for(source)
+                            persistent_report = self.runner.report_path_for(self.reports_path, source)
+                            if session_report.exists():
+                                persistent_report.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(session_report, persistent_report)
+                            saved_output = getattr(self, "_pending_save_outputs", {}).get(pl_key)
+                            if saved_output is not None:
+                                self._write_progress_marker(pl_key, saved_output, source)
                         sel = self._selections_by_key.get(pl_key, {}) or {}
                         self._save_selections_for_key(pl_key, sel)
-                        self._saved_keys.add(pl_key)   # ✅ 標記：這個 key 已 Save，Unresolved 之後要 hide
+                        self._saved_keys.add(pl_key)
+                        self._persisted_progress_keys.add(pl_key)
                     self._pending_save_keys = []
+                    self._pending_save_sources = {}
+                    self._pending_save_outputs = {}
                     self._last_action = None
 
                 done = outs.get("done", [])

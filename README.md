@@ -1,124 +1,192 @@
-**Playlist Fixer** helps you recover and reuse playlists when music files still exist,  
-but paths, formats, or devices have changed.
+# Playlist Fixer
 
-It is a utility for repairing broken `.m3u / .m3u8` playlists  
-when audio files are moved, renamed, converted, or used across different devices.
+**Playlist Fixer repairs broken file-based playlists by reconnecting them to audio files that still exist in your music library.**
 
-It is designed for **file-based playlist users** — not tied to any specific player.
+It is designed for playlists that stop working after files are moved, renamed, converted, reorganized, or transferred between computers and audio devices.
 
----
+Playlist Fixer works locally, does not modify your music files, and does not overwrite the original playlist.
 
-## What Problem Does This Solve?
-
-If you ever experienced:
-
-- Changing computers and **all playlists break**
-- Converting audio formats (FLAC → ALAC / WAV / DSF…) and playlists no longer work
-- Moving music folders and **paths no longer match**
-- DAP (Digital Audio Player) **missing tracks or failing to load playlists**
-- Wanting to move **DAP playlists back to PC/Mac players**
-- Playlists partially working but **silently skipping songs**
-
- **Playlist Fixer is built for exactly these situations.**
+> If the file still exists somewhere, Playlist Fixer tries to find it.
 
 ---
 
-## What Playlist Fixer Can Do
+## What It Can Repair
 
-- Repair broken `.m3u / .m3u8` playlists
-- Automatically re-link tracks by scanning your music library
-- Handle:
-  - Moved folders
-  - Renamed files
-  - Different drive letters
-  - Format changes (FLAC / ALAC / WAV / DSF / DFF / etc.)
-- Detect and classify:
-  - ✅ Automatically resolved tracks
-  - ⚠️ Ambiguous matches (multiple candidates)
-  - ❌ Missing / failed tracks
-- Let users **manually choose the correct file** when needed
-- Export a **clean, fixed playlist** without modifying originals
+Playlist Fixer can help when:
+
+- You move to a new computer or drive
+- Music folders are reorganized
+- Drive letters or root folders change
+- Audio files are renamed
+- Audio formats are converted
+- Playlists are moved between PC, Mac, and DAP devices
+- A DAP loads only part of a playlist
+- Roon exports point to paths from another computer
+- A playlist contains broken, outdated, relative, or device-specific paths
 
 ---
 
-## DAP & Cross-Device Use
+## Core Features
 
-Playlist Fixer is especially useful if you:
-
-- Use **DAPs** (Sony, Astell&Kern, FiiO, iBasso, etc.)
-- Move playlists between:
-  - Windows / macOS
-  - Computer ↔ DAP
-- Have playlists that:
-  - Load but miss tracks
-  - Fail due to unsupported paths or formats
-
-It works at the **file & path level**, not player-specific logic.
+- Repair broken `.m3u` and `.m3u8` playlists
+- Import and repair Roon `.xlsx` playlist exports
+- Parse Roon-style relative-path `.m3u` exports
+- Reconnect tracks after folder, filename, drive, device, or format changes
+- Build a searchable local index of your music library
+- Add new music folders without rescanning the entire library
+- Rescan only the folder you choose
+- Use Music Root checkboxes to control which libraries Repair may search
+- Automatically classify tracks as:
+  - Kept
+  - Automatically repaired
+  - Ambiguous
+  - Failed
+- Review all automatically repaired tracks in the Resolved view
+- Manually replace an incorrect automatic match
+- Choose between multiple candidates
+- Browse for missing tracks manually
+- Save unfinished repair progress and continue later
+- Keep unsaved Repair results temporary
+- Generate CSV reports for review and troubleshooting
+- Export a new repaired M3U playlist without changing the original
 
 ---
 
-## Why This Tool Exists
+## Roon Support
 
-Most players assume:
-> “If the path is broken, the playlist is dead.”
+Playlist Fixer includes dedicated handling for Roon exports.
 
-Playlist Fixer assumes:
-> “If the file still exists somewhere, we can find it.”
+### Roon XLSX
 
-This tool is built for people who **organize music seriously** and rely on playlists.
+Roon XLSX exports can contain useful metadata such as:
+
+- Title
+- Track Artist
+- Album Artist
+- Album
+- Disc number
+- Track number
+- Original path
+
+Playlist Fixer uses this information to find matching local files even when the original absolute path belongs to another computer.
+
+### Roon M3U
+
+Roon may export relative paths such as:
+
+```text
+../Artist/Album/1-02 Song.flac
+```
+
+Playlist Fixer can interpret the artist, album, disc, track number, title, and path structure instead of treating the line as a normal local path only.
+
+---
+
+## Supported Playlist Formats
+
+- `.m3u`
+- `.m3u8`
+- Roon `.m3u` exports
+- Roon `.xlsx` exports
+
+---
+
+## Supported Audio Formats
+
+Playlist Fixer can scan and match the following audio formats:
+
+### Lossy
+
+- MP3
+- AAC
+- OGG Vorbis
+- Opus
+- MP4 / M4A audio
+
+### Lossless and Uncompressed
+
+- FLAC
+- ALAC
+- M4A
+- WAV
+- AIFF / AIF / AIFC
+- APE
+- WavPack (`.wv`)
+
+### DSD
+
+- DSF
+- DFF
+
+DSF and DFF support is best effort.
+
+Matching quality depends on the metadata, filename, duration, path, and folder information available in each file.
+
+---
+
+## Safe by Design
+
+Playlist Fixer is designed to avoid destructive changes:
+
+- Music files are never modified
+- Original playlists are not overwritten
+- Repair results remain temporary until saved
+- Low-confidence matches are not forced automatically
+- Ambiguous results remain available for manual review
+- Resolved tracks remain visible so automatic choices can be audited
+- Reports are generated for transparency
 
 ---
 
 ## Typical Workflow
 
-1. Scan your music folders (build index)
-2. Import broken playlist(s)
-3. Run **Repair**
-4. Review:
-   - Ambiguous tracks → choose correct file
-   - Failed tracks → browse manually
-5. Save fixed playlist
-6. Use it anywhere (PC, Mac, DAP)
+1. Add one or more music folders
+2. Scan new folders to build the index
+3. Select which Music Roots Repair may use
+4. Import a playlist
+5. Run **Repair (Safe)**
+6. Review Unresolved and Resolved tracks
+7. Correct any ambiguous, failed, or incorrect matches
+8. Save the repaired playlist
+
+For detailed instructions, see the full manuals below.
 
 ---
 
-## Supported Playlist Format
+## Documentation
 
-- `.m3u`
-- `.m3u8`
+- [English Manual](README_EN.md)
+- [繁體中文說明書](README_ZH-TW.md)
+- [日本語マニュアル](README_JP.md)
 
-(Plain text, file-based playlists)
+---
+
+## What Playlist Fixer Does Not Do
+
+Playlist Fixer does not:
+
+- Download missing music files
+- Edit audio tags or metadata
+- Manage streaming-service playlists
+- Repair Spotify, Apple Music, or other online playlists
+- Guarantee automatic recovery when there is not enough reliable information
+
+---
+
+## Privacy
+
+- No ads
+- No paywall
+- No network access required
+- Local file processing only
 
 ---
 
 ## Status
 
-- Actively developed
-- No ads
-- No paywall
-- No network access
-- Local file processing only
+Playlist Fixer is actively developed.
 
----
-
-## Download (Important)
-
-⚠️ **Do NOT download the source code ZIP if you just want to use the app.**
-
-To use Playlist Fixer:
-1. Go to the **Releases** page (right side of this page)
-2. Download the **Windows portable executable (.exe)**
-3. No Python or installation required
-
-The source code is for developers only.
-
----
-
-## Platform
-
-- **Windows:** Portable executable (no installation required)
-- **macOS:** Not available yet  
-  *(macOS build is planned, but I currently don’t have a Mac for packaging/testing)*
+Bug reports, unusual playlist samples, and feedback are welcome.
 
 ---
 
@@ -128,4 +196,11 @@ MIT License — free to use, modify, and distribute.
 
 ---
 
-For detailed usage instructions, see the documentation in the `docs/` folder. (EN/JP/CH)
+## Author and Contact
+
+**Author:** Ne  
+**GitHub:** https://github.com/Nechani  
+**Issues and feedback:** plfixne@gmail.com  
+**Support:** https://ko-fi.com/nechani
+
+If Playlist Fixer saves you time or rescues a playlist you built over years, consider supporting development. ☕

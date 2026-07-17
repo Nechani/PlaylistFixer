@@ -179,3 +179,9 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+.venv/
+data/music_index.json
+data/music_index.stats.json
+data/settings.json
+data/reports/
+logs/

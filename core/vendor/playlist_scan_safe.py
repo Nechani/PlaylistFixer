@@ -3,12 +3,7 @@
 """
 playlist_scan_safe.py
 
-Build a robust music_index.json that *does not drop files* just because tags are missing.
-Priority for metadata:
-  0) easy tags (mutagen File(..., easy=True))
-  1) raw tags (mutagen File(..., easy=False)) for formats where easy tags are empty (common with AIFF/AIFC)
-  2) filename-derived title
-  3) path-derived artist guess (weak signal; only a fallback)
+Build a robust music_index.json that does not drop files just because tags are missing.
 
 Each index item includes:
   - path: absolute path
@@ -17,7 +12,8 @@ Each index item includes:
   - artist: string or None
   - meta_source: "easy_tag" | "raw_tag" | "filename" | "path_guess" | "none"
 
-This scanner is designed for messy folder structures — it does NOT assume Artist/Album layout.
+Also returns ext_counts for UI:
+  - ext_counts: {".flac": 123, ".mp3": 45, ...}
 """
 
 import argparse
@@ -25,12 +21,13 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 from mutagen import File
 
 SUPPORTED_EXTS = {
-    ".flac", ".alac", ".m4a", ".mp4", ".aac", ".mp3", ".ogg", ".opus", ".wav", ".aif", ".aiff", ".aifc", ".ape", ".wv", ".dsf", ".dff"
+    ".flac", ".alac", ".m4a", ".mp4", ".aac", ".mp3", ".ogg", ".opus",
+    ".wav", ".aif", ".aiff", ".aifc", ".ape", ".wv", ".dsf", ".dff"
 }
 
 GENERIC_PATH_TOKENS = {
@@ -128,13 +125,17 @@ def scan_folder(root: Path):
     items = []
     scanned = 0
     skipped_no_duration = 0
+    ext_counts: Dict[str, int] = {}
 
     for dirpath, _, filenames in os.walk(root):
         for fn in filenames:
             ext = Path(fn).suffix.lower()
             if ext not in SUPPORTED_EXTS:
                 continue
+
             scanned += 1
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+
             p = Path(dirpath) / fn
 
             dur = None
@@ -188,6 +189,7 @@ def scan_folder(root: Path):
 
             items.append({
                 "path": str(p),
+                "root": str(root),
                 "duration": int(dur),
                 "title": title,
                 "artist": artist,
@@ -199,6 +201,7 @@ def scan_folder(root: Path):
         "scanned_supported": scanned,
         "skipped_no_duration": skipped_no_duration,
         "indexed": len(items),
+        "ext_counts": ext_counts,
         "items": items
     }
 
@@ -217,14 +220,10 @@ def main():
     result = scan_folder(root)
 
     out.write_text(json.dumps(result["items"], ensure_ascii=False, indent=2), encoding="utf-8")
-
     stats_path = out.with_suffix(".stats.json")
     stats_path.write_text(
-        json.dumps(
-            {k: result[k] for k in ["root", "scanned_supported", "skipped_no_duration", "indexed"]},
-            ensure_ascii=False,
-            indent=2,
-        ),
+        json.dumps({k: result[k] for k in ["root", "scanned_supported", "skipped_no_duration", "indexed", "ext_counts"]},
+                   ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -235,25 +234,6 @@ def main():
     print(f"寫入 index 筆數: {result['indexed']}")
     print(f"輸出 index: {out}")
     print(f"統計檔: {stats_path}")
-
-
-def scan_multiple_roots(roots):
-    """Scan multiple roots and return combined items + stats."""
-    combined = []
-    stats = {
-        "roots": [],
-        "scanned_supported": 0,
-        "skipped_no_duration": 0,
-        "indexed": 0,
-    }
-    for r in roots:
-        res = scan_folder(Path(r).expanduser().resolve())
-        stats["roots"].append(res["root"])
-        stats["scanned_supported"] += int(res.get("scanned_supported", 0))
-        stats["skipped_no_duration"] += int(res.get("skipped_no_duration", 0))
-        combined.extend(res["items"])
-    stats["indexed"] = len(combined)
-    return {"items": combined, "stats": stats}
 
 if __name__ == "__main__":
     main()
