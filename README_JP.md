@@ -191,6 +191,10 @@ Resolved は監査用の画面でもあります。自動一致が間違って�
 
 現在の選択を適用します。
 
+Unresolved では、項目は元の位置に残り `✓` に変わります。Save するまでは Resolved へ移動しません。
+
+Resolved で手動変更した項目にも、一時的に `✓` が表示されます。
+
 Save を実行するまでは、適用内容は現在のセッション内の一時状態です。
 
 ### Save Fixed Playlist
@@ -203,13 +207,13 @@ Save を実行するまでは、適用内容は現在のセッション内の一
 
 ### 4.1 初回の音楽インデックス作成
 
-1. `Add Music Folder` をクリック
+1. `Add Music Folders` をクリック
 2. 音楽ファイルを含むフォルダを選択
 3. 新しいパスに `[Pending scan]` が表示される
 4. `Scan New Folders` をクリック
 5. スキャン成功後、そのパスが正式な Music Root になる
 
-フォルダが存在しない、読み取れない、または対応音楽ファイルが見つからない場合、そのフォルダは有効な Music Root として保持されません。
+パスは、一時的に利用できない、現在読み取れない、またはインデックス済み音楽ファイルが 0 件の場合でも Music Roots 一覧に残ります。状態に応じて `[Unavailable]`、`[Index missing]`、または `[Pending scan]` が表示されます。削除するには `Remove Selected` または `Clear All` を使用します。
 
 ### 4.2 後から別の音楽フォルダを追加する
 
@@ -228,7 +232,7 @@ E:\New Music
 
 必要な操作は次のとおりです。
 
-1. Add Music Folder
+1. Add Music Folders
 2. `E:\New Music` を選択
 3. `Scan New Folders` をクリック
 
@@ -355,7 +359,7 @@ Repair 後、各項目は次のいずれかになります。
 
 ### Kept original
 
-元のパスが現在も有効で、変更不要です。
+元のパスが現在も有効で、チェック済み Music Roots の範囲内にあるため変更不要です。
 
 ### Auto repaired
 
@@ -365,13 +369,17 @@ Repair 後、各項目は次のいずれかになります。
 
 ユーザーが正しいファイルを手動で選択しました。
 
-### Ambiguous
+### Ambiguous（`△`）
 
-複数の妥当な候補が見つかりましたが、安全に 1 つへ絞り込めませんでした。
+1 つ以上の妥当な候補が見つかりましたが、安全に 1 つへ絞り込めませんでした。手動確認が必要です。
 
-### Failed
+### Failed（`✕`）
 
-十分に信頼できる候補が見つかりませんでした。
+十分に信頼できる候補が見つかりませんでした。Browse を使用して正しい音楽ファイルを手動で探します。
+
+### Manually fixed, not saved（`✓`）
+
+手動選択は適用済みですが、まだ Save していません。これは一時状態です。
 
 ---
 
@@ -382,9 +390,14 @@ Repair 後、各項目は次のいずれかになります。
 次の項目が含まれます。
 
 - まだ Repair されていない項目
-- Ambiguous
-- Failed
+- `△` Ambiguous
+- `✕` Failed
 - 選択はしたがまだ Apply していない項目
+- 手動修正済みだが未保存の `✓` 項目
+
+Ambiguous と Failed は同じ表に表示され、既定では `△` が先、その後に `✕` が表示されます。
+
+Apply 後も項目は元の位置に残り `✓` に変わります。Save 後に Resolved へ移動します。
 
 ### Resolved
 
@@ -392,9 +405,9 @@ Repair 後、各項目は次のいずれかになります。
 
 - Kept original
 - Auto repaired
-- Manual selection
+- 保存済みの Manual selection
 
-Resolved の項目も再編集できます。
+Resolved の項目も再編集できます。新しい手動変更には Save まで `✓` が表示され、保存後に消えます。
 
 たとえば、自動一致が次のような項目を取り違える場合があります。
 
@@ -410,11 +423,12 @@ Resolved で対象項目を選択し、別の候補を選ぶか Browse で正し
 
 ## 9. Ambiguous の処理
 
-1. Unresolved で Ambiguous 項目を選択
+1. Unresolved で `△` の Ambiguous 項目を選択
 2. Candidates を確認
 3. 正しいファイルを選択
 4. Apply をクリック
-5. 項目が Resolved に移動
+5. 項目は元の位置に残り `✓` に変わる
+6. `Save Fixed Playlist` を押すと Resolved へ移動
 
 特に次を確認してください。
 
@@ -429,11 +443,12 @@ Resolved で対象項目を選択し、別の候補を選ぶか Browse で正し
 
 ## 10. Failed の処理
 
-1. Unresolved で Failed 項目を選択
+1. Unresolved で `✕` の Failed 項目を選択
 2. Browse をクリック
-3. 正しい音楽ファイルを選択
+3. 正しい音楽ファイルを手動で探して選択
 4. Apply をクリック
-5. 項目が Resolved に移動
+5. 項目は元の位置に残り `✓` に変わる
+6. `Save Fixed Playlist` を押すと Resolved へ移動
 
 音楽ファイル自体が存在しない場合は修復できません。
 
@@ -448,7 +463,10 @@ Resolved で対象項目を選択し、別の候補を選ぶか Browse で正し
 Repair 実行後：
 
 - 自動修復結果が表示される
-- 手動 Apply の内容が保持される
+- Ambiguous は `△` で表示される
+- Failed は `✕` で表示される
+- 手動 Apply の内容は `✓` で表示される
+- `✓` の項目は元の位置に残る
 - ただし正式な修復進捗はまだ作成されない
 
 Save せずに別のプレイリストへ移動し、元のプレイリストを再度読み込んだ場合、そのプレイリストは正式には未修復として扱われます。
@@ -463,6 +481,8 @@ Repair を再実行して再スキャンを確認すると、現在の画面は�
 - Repair レポートが保存される
 - 手動選択が保存される
 - 未完了の進捗も保存される
+- Unresolved の `✓` 項目が Resolved へ移動する
+- Resolved の未保存 `✓` 表示が消える
 - 後で続きから再開できる
 
 ### 元プレイリストと修復済みプレイリストは別管理

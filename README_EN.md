@@ -191,6 +191,10 @@ Lets you manually select the correct audio file when no reliable candidate is av
 
 Applies the current selection.
 
+In Unresolved, the entry stays in the same position and changes to `✓`. It does not move to Resolved until Save.
+
+In Resolved, a manual change also shows `✓` temporarily.
+
 Until Save is used, applied choices remain temporary for the current session.
 
 ### Save Fixed Playlist
@@ -203,13 +207,13 @@ Creates the repaired playlist and saves the current progress.
 
 ### 4.1 Creating Your First Music Index
 
-1. Click `Add Music Folder`
+1. Click `Add Music Folders`
 2. Select a folder containing audio files
 3. The new path is shown as `[Pending scan]`
 4. Click `Scan New Folders`
 5. After a successful scan, the path becomes a regular Music Root
 
-If the folder does not exist, cannot be read, or contains no supported audio files, it will not be kept as a valid Music Root.
+The path remains in the Music Roots list even if it is temporarily unavailable, cannot currently be read, or contains no indexed audio files. It is marked `[Unavailable]`, `[Index missing]`, or `[Pending scan]` as appropriate. Use `Remove Selected` or `Clear All` to remove it.
 
 ### 4.2 Adding Another Music Folder Later
 
@@ -228,7 +232,7 @@ E:\New Music
 
 you only need to:
 
-1. Click Add Music Folder
+1. Click Add Music Folders
 2. Select `E:\New Music`
 3. Click `Scan New Folders`
 
@@ -355,7 +359,7 @@ After Repair, an entry may have one of these statuses:
 
 ### Kept original
 
-The original path is still valid and does not need to be changed.
+The original path is still valid and is inside the checked Music Roots, so it does not need to be changed.
 
 ### Auto repaired
 
@@ -365,13 +369,17 @@ Playlist Fixer found one clear, high-confidence candidate and re-linked the entr
 
 You manually selected the correct file.
 
-### Ambiguous
+### Ambiguous (`△`)
 
-Multiple reasonable candidates were found, but Playlist Fixer could not safely determine which one is correct.
+One or more reasonable candidates were found, but Playlist Fixer could not safely determine which one is correct. Manual confirmation is required.
 
-### Failed
+### Failed (`✕`)
 
-No sufficiently reliable candidate was found.
+No sufficiently reliable candidate was found. Use Browse to locate the correct audio file manually.
+
+### Manually fixed, not saved (`✓`)
+
+A manual selection has been applied but has not yet been saved. This is a temporary state.
 
 ---
 
@@ -382,9 +390,14 @@ No sufficiently reliable candidate was found.
 Contains:
 
 - Entries not yet repaired
-- Ambiguous entries
-- Failed entries
+- `△` Ambiguous entries
+- `✕` Failed entries
 - Entries with a selection that has not yet been applied
+- `✓` entries that were manually fixed but not yet saved
+
+Ambiguous and Failed entries appear in the same table, with `△` shown before `✕` by default.
+
+After Apply, the entry stays in its current position and changes to `✓`. It moves to Resolved only after Save.
 
 ### Resolved
 
@@ -392,9 +405,9 @@ Contains:
 
 - Kept original
 - Auto repaired
-- Manual selection
+- Saved manual selections
 
-Resolved entries can still be edited.
+Resolved entries can still be edited. A new manual change shows `✓` until Save, then the mark disappears.
 
 For example, an automatic match may confuse:
 
@@ -410,11 +423,12 @@ Select the entry in Resolved, choose another candidate or browse to the correct 
 
 ## 9. Handling Ambiguous Entries
 
-1. Select an Ambiguous entry in Unresolved
+1. Select an Ambiguous entry marked `△` in Unresolved
 2. Review the Candidates list
 3. Select the correct file
 4. Click Apply
-5. The entry moves to Resolved
+5. The entry stays in place and changes to `✓`
+6. Click `Save Fixed Playlist` to move it to Resolved
 
 Pay special attention to:
 
@@ -429,11 +443,12 @@ Pay special attention to:
 
 ## 10. Handling Failed Entries
 
-1. Select a Failed entry in Unresolved
+1. Select a Failed entry marked `✕` in Unresolved
 2. Click Browse
-3. Select the correct audio file
+3. Locate and select the correct audio file
 4. Click Apply
-5. The entry moves to Resolved
+5. The entry stays in place and changes to `✓`
+6. Click `Save Fixed Playlist` to move it to Resolved
 
 If the audio file no longer exists, it cannot be repaired.
 
@@ -448,7 +463,10 @@ This is an important safety feature.
 After Repair:
 
 - Automatic results are displayed
-- Manual Apply choices are kept
+- Ambiguous entries are marked `△`
+- Failed entries are marked `✕`
+- Manual Apply choices are marked `✓`
+- `✓` entries remain in their current positions
 - But no permanent repair progress has been created yet
 
 If you leave the playlist without saving and import the original playlist again, it is treated as not permanently repaired.
@@ -463,6 +481,8 @@ After you click `Save Fixed Playlist`:
 - The Repair report is saved
 - Manual selections are saved
 - Incomplete progress is saved
+- `✓` entries in Unresolved move to Resolved
+- Unsaved `✓` marks in Resolved disappear
 - You can continue later
 
 ### Original and Repaired Playlists Use Separate Progress
