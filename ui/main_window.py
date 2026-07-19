@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QTableWidget, QTableWidgetItem, QGroupBox,
     QListWidget, QListWidgetItem, QAbstractItemView,
-    QLineEdit, QDialog, QTextBrowser, QSplitter
+    QLineEdit, QDialog, QTextBrowser, QSplitter, QListView, QTreeView
 )
 
 from core.runner import TaskRunner, TaskResult
@@ -53,7 +53,7 @@ class MainWindow(QMainWindow):
     def __init__(self, app_data=None):
         super().__init__()
         self.app_data = app_data
-        self.setWindowTitle("Playlist Fixer v2.0.0")
+        self.setWindowTitle("Playlist Fixer v2.1.0")
 
         self.runner = TaskRunner()
 
@@ -77,6 +77,13 @@ class MainWindow(QMainWindow):
 
         # selections keyed by stable pl_key -> {row_index(str): chosen_path}
         self._selections_by_key: dict[str, dict[str, str]] = {}
+        # Rows changed by Apply in the current unsaved session.
+        # Kept separate from persisted selections so only new manual edits show ✓.
+        self._dirty_selection_ids: set[tuple[str, str]] = set()
+        # Remember where an unsaved Apply was made.  An edit made in
+        # Unresolved must stay only in Unresolved until Save; an edit made in
+        # Resolved may be previewed in Resolved immediately.
+        self._selection_origin: dict[tuple[str, str], str] = {}
 
         # cache report rows per playlist key (raw report csv rows)
         self._report_rows_by_key: dict[str, list[dict]] = {}
@@ -84,6 +91,10 @@ class MainWindow(QMainWindow):
         
         self._saved_keys: set[str] = set()
         self._persisted_progress_keys: set[str] = set()
+        # Playlists currently being re-repaired provisionally from a clean state.
+        # Existing saved reports/selections remain on disk until Save, but must not
+        # leak into the current Unresolved/Resolved views.
+        self._provisional_reset_keys: set[str] = set()
 
         self._active_target: str | None = None   # "AMBIGUOUS" | "FAILED"
         self._active_pl_key: str | None = None
@@ -103,7 +114,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._load_music_roots()
-        self._prune_saved_roots_against_index()
         self._refresh_music_roots_ui()
 
     # ---------- persistence ----------
@@ -215,19 +225,52 @@ class MainWindow(QMainWindow):
     def _load_music_roots(self) -> None:
         settings = self._load_settings()
         raw = settings.get("music_roots", [])
+        indexed = self._indexed_root_paths()
+
+        def norm(value: object) -> str:
+            return os.path.normcase(os.path.normpath(str(value)))
+
+        indexed_by_key = {norm(x): str(x) for x in indexed}
         roots: list[dict] = []
+        seen: set[str] = set()
+
+        # Settings are the source of truth for what the user added.  Do not
+        # delete entries merely because the index or stats file is temporarily
+        # missing, unreadable, or belongs to a disconnected external drive.
         if isinstance(raw, list):
             for entry in raw:
                 if isinstance(entry, str):
-                    roots.append({"path": entry, "enabled": True, "imported": True})
+                    path = entry
+                    enabled = True
+                    saved_imported = True
                 elif isinstance(entry, dict) and entry.get("path"):
-                    roots.append({
-                        "path": str(entry["path"]),
-                        "enabled": bool(entry.get("enabled", True)),
-                        # Anything already persisted by an older build is treated as
-                        # imported initially, then verified against index stats below.
-                        "imported": bool(entry.get("imported", True)),
-                    })
+                    path = str(entry["path"])
+                    enabled = bool(entry.get("enabled", True))
+                    saved_imported = bool(entry.get("imported", False))
+                else:
+                    continue
+
+                key = norm(path)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                imported = saved_imported or key in indexed_by_key
+                roots.append({
+                    "path": path,
+                    "enabled": enabled,
+                    # Keep the saved state, but also recover Imported when the
+                    # stats file still confirms this root.
+                    "imported": imported,
+                    # A saved imported root without a matching stats entry means
+                    # the index metadata was deleted, damaged, or replaced.
+                    "index_missing": imported and key not in indexed_by_key,
+                })
+
+        # Music Roots are computer-specific settings stored in AppData.
+        # Index metadata may have been carried from another computer with the
+        # portable program folder, so it must never create additional roots.
+        # Roots found only in music_index.stats.json are intentionally ignored.
+
         self.music_roots = roots
 
     def _indexed_root_paths(self) -> set[str]:
@@ -262,11 +305,15 @@ class MainWindow(QMainWindow):
 
     def _save_music_roots(self) -> None:
         settings = self._load_settings()
-        # Pending folders are session-only. Persist only folders that have
-        # successfully contributed at least one track to an index.
+        # Persist every folder the user added, including Pending folders.
+        # The index files are database data, not the only copy of the UI list.
         settings["music_roots"] = [
-            {"path": r["path"], "enabled": bool(r.get("enabled", True)), "imported": True}
-            for r in self.music_roots if r.get("imported", False)
+            {
+                "path": r["path"],
+                "enabled": bool(r.get("enabled", True)),
+                "imported": bool(r.get("imported", False)),
+            }
+            for r in self.music_roots if r.get("path")
         ]
         self._save_settings(settings)
 
@@ -375,7 +422,7 @@ class MainWindow(QMainWindow):
         roots_l = QVBoxLayout(roots_box)
 
         roots_btn_row = QHBoxLayout()
-        self.btn_add_music = QPushButton("Add Music Folder")
+        self.btn_add_music = QPushButton("Add Music Folders")
         self.btn_remove_music = QPushButton("Remove Selected")
         self.btn_clear_music = QPushButton("Clear All")
         roots_btn_row.addWidget(self.btn_add_music, 2)
@@ -422,7 +469,7 @@ class MainWindow(QMainWindow):
 
         search_row = QHBoxLayout()
         self.edt_search = QLineEdit()
-        self.edt_search.setPlaceholderText("Search song / filename / path (A or B)…")
+        self.edt_search.setPlaceholderText("Search song / filename / path…")
         self.btn_clear_search = QPushButton("Clear")
         search_row.addWidget(QLabel("Search:"), 0)
         search_row.addWidget(self.edt_search, 1)
@@ -447,40 +494,31 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.btn_save_fixed, 2)
 
         # =========================
-        # Panes (Ambiguous / Candidates / Failed)
+        # Unified repair queue + candidates
         # =========================
-        boxA = QGroupBox("UNRESOLVED / AMBIGUOUS (select row → choose candidate → Apply → Save)")
+        boxA = QGroupBox("△ AMBIGUOUS / ✕ FAILED  (select row → choose candidate or Browse → Apply → Save)")
         boxA_l = QVBoxLayout(boxA)
-        self.tbl_amb = QTableWidget(0, 4)
-        self.tbl_amb.setHorizontalHeaderLabels(["Playlist", "EXTINF", "Original Path", "Notes"])
-        self.tbl_amb.horizontalHeader().setStretchLastSection(True)
-        self._setup_table(self.tbl_amb)
-        boxA_l.addWidget(self.tbl_amb)
+        self.tbl_repair = QTableWidget(0, 5)
+        self.tbl_repair.setHorizontalHeaderLabels(["Status", "Playlist", "EXTINF", "Original Path", "Notes"])
+        self.tbl_repair.horizontalHeader().setStretchLastSection(True)
+        # Column-header sorting was removed: changing sort keys made the repair
+        # workflow order difficult to follow, especially after Apply.
+        self.tbl_repair.horizontalHeader().setSectionsClickable(False)
+        self.tbl_repair.setSortingEnabled(False)
+        self.tbl_repair.setColumnWidth(0, 64)
+        self._setup_table(self.tbl_repair)
+        boxA_l.addWidget(self.tbl_repair)
 
-        # Candidates pane (獨立出來)
         boxC = QGroupBox("Candidates / Picked file")
         boxC_l = QVBoxLayout(boxC)
         self.lst_candidates = QListWidget()
         boxC_l.addWidget(self.lst_candidates)
 
-        boxF = QGroupBox("FAILED (select row → Browse → Apply → Save)")
-        boxF_l = QVBoxLayout(boxF)
-        self.tbl_fail = QTableWidget(0, 4)
-        self.tbl_fail.setHorizontalHeaderLabels(["Playlist", "EXTINF", "Original Path", "Notes"])
-        self.tbl_fail.horizontalHeader().setStretchLastSection(True)
-        self._setup_table(self.tbl_fail)
-        boxF_l.addWidget(self.tbl_fail)
-
-        # Inner splitter: A / C / F
         inner_splitter = QSplitter(Qt.Vertical)
         inner_splitter.addWidget(boxA)
         inner_splitter.addWidget(boxC)
-        inner_splitter.addWidget(boxF)
-
-        # 讓 table 區域吃更多高度
         inner_splitter.setStretchFactor(0, 5)
         inner_splitter.setStretchFactor(1, 2)
-        inner_splitter.setStretchFactor(2, 4)
 
         # =========================
         # Lower container: fixed rows + inner splitter
@@ -504,17 +542,22 @@ class MainWindow(QMainWindow):
         outer_splitter.addWidget(lower)
         outer_splitter.setStretchFactor(0, 1)
         outer_splitter.setStretchFactor(1, 9)
+        outer_splitter.setChildrenCollapsible(False)
+        outer_splitter.setHandleWidth(8)
+        inner_splitter.setChildrenCollapsible(False)
+        inner_splitter.setHandleWidth(8)
 
-        # Optional: reasonable default sizes (small screen friendly)
+        # Both Music Roots and the repair/candidate areas can be resized by
+        # dragging their splitter handles.
         outer_splitter.setSizes([160, 900])
-        inner_splitter.setSizes([420, 220, 360])
+        inner_splitter.setSizes([520, 260])
 
         layout.addWidget(outer_splitter, 1)
 
         # =========================
         # Info button in status bar (右下角)
         # =========================
-        self.lbl_build = QLabel("v2.0.0")
+        self.lbl_build = QLabel("v2.1.0")
         self.lbl_build.setToolTip("Build identifier. If this is not visible, an older copy is running.")
         self.statusBar().addPermanentWidget(self.lbl_build)
 
@@ -536,8 +579,7 @@ class MainWindow(QMainWindow):
         self.btn_repair_safe.clicked.connect(self.on_repair_safe)
         self.btn_open_reports.clicked.connect(self.on_open_reports)
 
-        self.tbl_amb.itemSelectionChanged.connect(self.on_ambiguous_selected)
-        self.tbl_fail.itemSelectionChanged.connect(self.on_failed_selected)
+        self.tbl_repair.itemSelectionChanged.connect(self.on_repair_selected)
 
         self.btn_apply_choice.clicked.connect(self.on_apply_choice)
         self.btn_browse_choice.clicked.connect(self.on_browse_choice)
@@ -557,20 +599,25 @@ class MainWindow(QMainWindow):
             path = str(entry.get("path", ""))
             available = Path(path).exists()
             imported = bool(entry.get("imported", False))
-            if not imported:
-                suffix = "  [Pending scan]"
-            elif not available:
+            index_missing = bool(entry.get("index_missing", False))
+            if not available:
                 suffix = "  [Unavailable]"
+            elif index_missing:
+                suffix = "  [Index missing]"
+            elif not imported:
+                suffix = "  [Pending scan]"
             else:
                 suffix = ""
             it = QListWidgetItem(path + suffix)
             it.setData(Qt.UserRole, path)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if entry.get("enabled", True) else Qt.Unchecked)
-            if not imported:
-                it.setToolTip("This folder is temporary until Scan New Folders successfully indexes at least one track.")
-            elif not available:
-                it.setToolTip("This imported folder is currently unavailable.")
+            if not available:
+                it.setToolTip("This Music Root is currently unavailable. Reconnect the drive or restore the folder.")
+            elif index_missing:
+                it.setToolTip("The folder exists, but its index record is missing. Scan or rescan this Music Root before Repair.")
+            elif not imported:
+                it.setToolTip("This folder has not been indexed yet. Use Scan New Folders.")
             self.lst_music_roots.addItem(it)
         self.lst_music_roots.blockSignals(False)
         self._update_music_roots_label()
@@ -671,7 +718,7 @@ class MainWindow(QMainWindow):
         self._persisted_progress_keys = set()
         self.reports_path.mkdir(parents=True, exist_ok=True)
 
-        for pl in self.playlists:
+        for playlist_order, pl in enumerate(self.playlists):
             pl_key = self.runner.canonical_key(pl)
             report_csv = None
             if pl_key in self._session_repaired_keys:
@@ -720,7 +767,10 @@ class MainWindow(QMainWindow):
             # report in this session. This also covers fixed_*_selected.m3u files imported
             # as a new input instead of treating them as invisible historical progress.
             if pl_key not in self._session_repaired_keys and not has_saved_progress:
-                amb_all.extend(self._parse_playlist_entries(pl))
+                pending_rows = self._parse_playlist_entries(pl)
+                for r in pending_rows:
+                    r["_bucket"] = "PENDING"
+                amb_all.extend(pending_rows)
                 continue
 
             if not report_rows:
@@ -730,7 +780,7 @@ class MainWindow(QMainWindow):
             # disk_sel: 以前 Save 過、寫在磁碟上的 selections（永遠視為已完成）
             # mem_sel : 本次 session Apply 但尚未 Save 的 selections
             disk_sel: dict[str, str] = {}
-            if has_saved_progress:
+            if has_saved_progress and pl_key not in self._provisional_reset_keys:
                 disk_sel = self._load_selections_for_key(pl_key) or {}
 
             mem_sel: dict[str, str] = self._selections_by_key.get(pl_key, {}) or {}
@@ -745,22 +795,41 @@ class MainWindow(QMainWindow):
                 amb = [r for r in amb if str(r.get("row_index")) not in disk_sel]
                 fail = [r for r in fail if str(r.get("row_index")) not in disk_sel]
 
-            # ✅ B) mem_sel：未 Save -> 不 hide，只打標；Save 後 -> hide
+            # B) In-memory selections can contain both already-saved choices and
+            # brand-new unsaved edits.  Do not use the playlist-level _saved_keys
+            # flag here: once a playlist has been saved once, that flag remains set
+            # and would incorrectly hide every later unsaved ✓ when the user switches
+            # views.  A row is unsaved only while its exact (playlist, row) key is in
+            # _dirty_selection_ids and the Apply was made in Unresolved.
             if mem_sel:
-                if pl_key in self._saved_keys:
-                    # 已 Save：把本次 mem_sel 也 hide
-                    amb = [r for r in amb if str(r.get("row_index")) not in mem_sel]
-                    fail = [r for r in fail if str(r.get("row_index")) not in mem_sel]
-                else:
-                    # 未 Save：保留列 + notes 打標
-                    for rr in amb:
-                        k = str(rr.get("row_index"))
-                        if k in mem_sel:
-                            rr["notes"] = f"[SELECTED] {mem_sel[k]}"
-                    for rr in fail:
-                        k = str(rr.get("row_index"))
-                        if k in mem_sel:
-                            rr["notes"] = f"[RESCUED] {mem_sel[k]}"
+                dirty_unresolved = {
+                    row_id
+                    for key, row_id in self._dirty_selection_ids
+                    if key == pl_key
+                    and self._selection_origin.get((key, row_id)) == "UNRESOLVED"
+                }
+
+                # Hide committed selections and edits made in Resolved; keep only
+                # current unsaved Unresolved edits in this workspace.
+                amb = [
+                    r for r in amb
+                    if str(r.get("row_index")) not in mem_sel
+                    or str(r.get("row_index")) in dirty_unresolved
+                ]
+                fail = [
+                    r for r in fail
+                    if str(r.get("row_index")) not in mem_sel
+                    or str(r.get("row_index")) in dirty_unresolved
+                ]
+
+                for rr in amb:
+                    k = str(rr.get("row_index"))
+                    if k in dirty_unresolved:
+                        rr["notes"] = f"[SELECTED] {mem_sel[k]}"
+                for rr in fail:
+                    k = str(rr.get("row_index"))
+                    if k in dirty_unresolved:
+                        rr["notes"] = f"[RESCUED] {mem_sel[k]}"
 
             # ✅ 把 merged 保存回記憶體（避免你匯入 exported 後，disk_sel 覆蓋掉本次 Apply 的 mem_sel）
             #    但注意：原始歌單你原本的設計是「不吃 disk」，所以這裡只有 exported 才會 merge disk
@@ -806,18 +875,31 @@ class MainWindow(QMainWindow):
                     return s
             return ""
 
-        for pl in self.playlists:
+        for playlist_order, pl in enumerate(self.playlists):
             pl_key = self.runner.canonical_key(pl)
 
             has_saved_progress = pl_key in self._persisted_progress_keys
+            saved_this_session = pl_key in self._saved_keys
+            has_committed_progress = (has_saved_progress or saved_this_session) and pl_key not in self._provisional_reset_keys
 
-            # Show resolved rows only for this session's provisional Repair or
-            # for progress that was explicitly committed with Save.
-            if pl_key not in self._session_repaired_keys and not has_saved_progress:
+            # Show resolved rows for this session's Repair, for progress loaded
+            # from an exported fixed playlist, or immediately after Save in the
+            # current session.  _reload_reports_cache() intentionally does not
+            # treat the original source playlist as persisted progress, so the
+            # separate saved_this_session flag is required here.
+            if pl_key not in self._session_repaired_keys and not has_committed_progress:
                 continue
 
-            disk_sel = self._load_selections_for_key(pl_key) if has_saved_progress else {}
-            mem_sel = self._selections_by_key.get(pl_key, {}) or {}
+            disk_sel = self._load_selections_for_key(pl_key) if has_committed_progress else {}
+            mem_sel_all = self._selections_by_key.get(pl_key, {}) or {}
+            # Only unsaved edits that were made while already in Resolved are
+            # previewed here.  Unsaved fixes made in Unresolved must not appear
+            # in Resolved before Save.
+            mem_sel = {
+                row_id: chosen
+                for row_id, chosen in mem_sel_all.items()
+                if self._selection_origin.get((pl_key, str(row_id))) == "RESOLVED"
+            }
             selections = {**disk_sel, **mem_sel}
 
             report_rows = self._report_rows_by_key.get(pl_key, [])
@@ -842,26 +924,28 @@ class MainWindow(QMainWindow):
                 if not is_resolved:
                     continue
 
-                # Decide bucket (heuristic but stable):
-                # 1) if status indicates ambiguous/failed => use it
-                # 2) else if notes includes multiple candidates => ambiguous
-                # 3) else => failed
-                bucket = ""
+                # Parse candidates once. Resolved previously parsed the same
+                # Notes field twice per row, which noticeably slowed large lists.
+                try:
+                    cands = self.runner._parse_candidates_from_notes(notes_raw) or []
+                except Exception:
+                    cands = []
+
+                # Decide bucket (used internally for candidate handling only).
                 if status in AMBIG_STATUSES:
                     bucket = "AMBIGUOUS"
                 elif status in FAIL_STATUSES:
                     bucket = "FAILED"
                 else:
-                    # heuristic: candidates in notes -> ambiguous-ish
-                    cands = []
-                    try:
-                        cands = self.runner._parse_candidates_from_notes(notes_raw) or []
-                    except Exception:
-                        cands = []
                     bucket = "AMBIGUOUS" if len(cands) >= 2 else "FAILED"
 
                 source_tag = "[MANUAL]" if manual else "[AUTO]"
                 status_tag = f"(status={status})" if status else ""
+
+                try:
+                    row_order = int(float(row_index))
+                except Exception:
+                    row_order = 10**12
 
                 row = {
                     "playlist": str(pl),
@@ -870,7 +954,10 @@ class MainWindow(QMainWindow):
                     "extinf_display": extinf_display,
                     "original_path": orig,
                     "notes": f"{source_tag} {after} {status_tag}".strip(),
-                    "candidates": (self.runner._parse_candidates_from_notes(notes_raw) if hasattr(self.runner, "_parse_candidates_from_notes") else []),
+                    "candidates": cands,
+                    "_bucket": bucket,
+                    "_playlist_order": playlist_order,
+                    "_row_order": row_order,
                 }
 
                 if bucket == "AMBIGUOUS":
@@ -883,8 +970,7 @@ class MainWindow(QMainWindow):
     def _refresh_tables_from_mode(self) -> None:
         """Rebuild visible rows based on current view mode and cached report rows."""
         # clear active selection & candidates
-        self.tbl_amb.clearSelection()
-        self.tbl_fail.clearSelection()
+        self.tbl_repair.clearSelection()
         self.lst_candidates.clear()
         self._active_target = None
         self._active_pl_key = None
@@ -915,20 +1001,82 @@ class MainWindow(QMainWindow):
         self._refresh_tables_from_mode()
 
     def on_add_music(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Music Folder")
-        if not folder:
-            return
-        p = Path(folder)
+        # Qt's native Windows folder picker only supports one folder.  Use the
+        # Qt dialog and enable extended selection in both directory views so
+        # the user can choose several sibling folders in one operation.
+        dialog = QFileDialog(self, "Select Music Folders")
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
 
-        if any(Path(r.get("path", "")) == p for r in self.music_roots):
-            self.status_label.setText(f"Already added: {folder}")
+        # PySide6 QObject.findChildren() accepts one Qt type at a time;
+        # passing a Python tuple raises TypeError. Configure both view types
+        # separately so the non-native folder dialog supports multi-selection.
+        for view_type in (QListView, QTreeView):
+            for view in dialog.findChildren(view_type):
+                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        if dialog.exec() != QDialog.Accepted:
             return
 
-        self.music_roots.append({"path": str(p), "enabled": True, "imported": False})
-        # Do not persist yet. A folder becomes permanent only after a scan
-        # successfully imports at least one track from it.
-        self._refresh_music_roots_ui()
-        self.status_label.setText(f"Pending scan: {folder}")
+        folders = dialog.selectedFiles()
+        if not folders:
+            return
+
+        # QFileDialog in non-native Directory mode may include the directory
+        # currently being viewed in selectedFiles(), even when the user only
+        # selected its child folders.  That caused the parent folder to be
+        # added unexpectedly.  When multiple folders were selected, discard
+        # the dialog's current directory and keep only the actual selections.
+        current_dir = os.path.normcase(
+            os.path.normpath(dialog.directory().absolutePath())
+        )
+        normalized_folders = []
+        seen_folders = set()
+        for folder in folders:
+            normalized = os.path.normcase(os.path.normpath(str(folder)))
+            if len(folders) > 1 and normalized == current_dir:
+                continue
+            if normalized in seen_folders or not Path(folder).is_dir():
+                continue
+            seen_folders.add(normalized)
+            normalized_folders.append(str(Path(folder)))
+
+        folders = normalized_folders
+        if not folders:
+            return
+
+        existing = {
+            os.path.normcase(os.path.normpath(str(r.get("path", ""))))
+            for r in self.music_roots
+        }
+        added = 0
+        duplicates = 0
+
+        for folder in folders:
+            p = Path(folder)
+            key = os.path.normcase(os.path.normpath(str(p)))
+            if key in existing:
+                duplicates += 1
+                continue
+
+            self.music_roots.append({"path": str(p), "enabled": True, "imported": False, "index_missing": False})
+            existing.add(key)
+            added += 1
+
+        if added:
+            # Save immediately so the list survives a restart even before Scan.
+            self._save_music_roots()
+            self._refresh_music_roots_ui()
+
+        if added and duplicates:
+            self.status_label.setText(
+                f"Pending scan: {added} folder(s); already added: {duplicates}"
+            )
+        elif added:
+            self.status_label.setText(f"Pending scan: {added} folder(s)")
+        else:
+            self.status_label.setText(f"Already added: {duplicates} folder(s)")
 
     def on_remove_music_roots(self):
         items = self.lst_music_roots.selectedItems()
@@ -968,7 +1116,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
             return
 
-        scan_roots = [Path(r["path"]) for r in self.music_roots if not r.get("imported", False)]
+        scan_roots = [
+            Path(r["path"])
+            for r in self.music_roots
+            if not r.get("imported", False) or r.get("index_missing", False)
+        ]
         if not scan_roots:
             QMessageBox.information(
                 self,
@@ -1053,10 +1205,47 @@ class MainWindow(QMainWindow):
        
         # load reports cache then refresh view
         self._selections_by_key = {}          # ✅ 清掉上一輪 Apply 的記憶體選擇
+        self._dirty_selection_ids.clear()      # 新 session 尚無未儲存修改
         self._session_repaired_keys = set()   # ✅ 新 session
         self._saved_keys = set()   # ✅ 新 session，尚未 Save
+        self._provisional_reset_keys = set()
         self._reload_reports_cache()
         self._refresh_tables_from_mode()
+
+    def _begin_clean_provisional_rerun(self, current_keys: set[str]) -> None:
+        """Reset current-session state while preserving previously saved files on disk."""
+        self._provisional_reset_keys.update(current_keys)
+        self._saved_keys.difference_update(current_keys)
+        self._persisted_progress_keys.difference_update(current_keys)
+        for pl_key in current_keys:
+            self._selections_by_key.pop(pl_key, None)
+        self._dirty_selection_ids = {
+            key for key in self._dirty_selection_ids if key[0] not in current_keys
+        }
+        self._selection_origin = {
+            key: origin
+            for key, origin in self._selection_origin.items()
+            if key[0] not in current_keys
+        }
+
+    def _saved_source_playlist(self, playlist: Path) -> Path | None:
+        """Return the original source recorded for an imported fixed playlist."""
+        pl_key = self.runner.canonical_key(playlist)
+        marker = self._progress_file_for_key(pl_key)
+        if not marker.exists():
+            return None
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            saved = data.get("saved_playlist")
+            source = data.get("source_playlist")
+            if not saved or not source:
+                return None
+            if self._normalized_playlist_path(Path(saved)) != self._normalized_playlist_path(playlist):
+                return None
+            source_path = Path(source)
+            return source_path if source_path.exists() else None
+        except Exception:
+            return None
 
     def on_repair_safe(self):
         if self._busy:
@@ -1069,9 +1258,49 @@ class MainWindow(QMainWindow):
         if not enabled_roots:
             QMessageBox.warning(self, "No music root", "Please enable at least one music folder before Repair.")
             return
+
+        missing_index_roots = [
+            str(r.get("path", ""))
+            for r in self.music_roots
+            if r.get("enabled", True) and r.get("index_missing", False)
+        ]
+        if missing_index_roots:
+            QMessageBox.warning(
+                self,
+                "Music Root index missing",
+                "These checked Music Roots exist, but their index records are missing:\n\n"
+                + "\n".join(missing_index_roots)
+                + "\n\nUse Scan New Folders or select them and use Rescan Selected before Repair.",
+            )
+            return
+
         if not self.index_path.exists():
             QMessageBox.warning(self, "No index", f"Index not found: {self.index_path}\nPlease use Scan New Folders first.")
             return
+
+        current_keys = {self.runner.canonical_key(pl) for pl in self.playlists}
+        is_repeat_repair = bool(current_keys & self._session_repaired_keys)
+
+        if is_repeat_repair:
+            answer = QMessageBox.question(
+                self,
+                "Run Repair again?",
+                "Repair has already been run for the current playlist.\n\n"
+                "Running it again will discard all unsaved Repair results and manual changes "
+                "marked with ✓, then repair the playlist again using the currently checked "
+                "Music Roots.\n\n"
+                "Saved progress and previously exported playlists will not be deleted.\n\n"
+                "Run Repair again?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+            # Start a genuinely clean provisional view. Saved files remain on
+            # disk, but old selections and old Resolved rows are ignored until
+            # the new provisional result is explicitly saved.
+            self._begin_clean_provisional_rerun(current_keys)
 
         # 防呆：避免誤按 Repair 覆寫 report
         has_any_report = any(
@@ -1079,7 +1308,7 @@ class MainWindow(QMainWindow):
             for pl in self.playlists
         )
 
-        if has_any_report:
+        if has_any_report and not is_repeat_repair:
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Question)
             box.setWindowTitle("Repair report exists")
@@ -1099,13 +1328,23 @@ class MainWindow(QMainWindow):
 
             if clicked == btn_resume:
                 self._session_repaired_keys = set()
+                self._provisional_reset_keys.difference_update(current_keys)
                 self._reload_reports_cache()
                 self._refresh_tables_from_mode()
                 self.status_label.setText("Resumed from saved progress.")
                 return
             if clicked == btn_cancel:
                 return
-            # clicked == btn_rerun -> create a provisional session report
+            # clicked == btn_rerun -> create a clean provisional session. If the
+            # imported file is a previously exported fixed playlist, re-run from
+            # its recorded original source so the behavior matches re-running in
+            # the same session.
+            original_playlists = []
+            for pl in self.playlists:
+                original_playlists.append(self._saved_source_playlist(pl) or pl)
+            self.playlists = original_playlists
+            current_keys = {self.runner.canonical_key(pl) for pl in self.playlists}
+            self._begin_clean_provisional_rerun(current_keys)
 
         # clear UI before repair
         self._ambiguous_rows = []
@@ -1116,8 +1355,7 @@ class MainWindow(QMainWindow):
         self._active_pl_key = None
         self._active_row_id = None
         self.lbl_target.setText("Target: (none)")
-        self._fill_table(self.tbl_amb, [])
-        self._fill_table(self.tbl_fail, [])
+        self._fill_table(self.tbl_repair, [])
         self.lst_candidates.clear()
         self._session_repaired_keys = {self.runner.canonical_key(pl) for pl in self.playlists}
 
@@ -1139,36 +1377,42 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
-    def on_ambiguous_selected(self):
-        if self.tbl_amb.selectionModel() and self.tbl_amb.selectionModel().hasSelection():
-            self.tbl_fail.clearSelection()
-            self._active_target = "AMBIGUOUS"
-            self._active_pl_key, self._active_row_id = self._selected_row_id(self.tbl_amb)
-            self._refresh_candidates_panel()
-
-    def on_failed_selected(self):
-        if self.tbl_fail.selectionModel() and self.tbl_fail.selectionModel().hasSelection():
-            self.tbl_amb.clearSelection()
-            self._active_target = "FAILED"
-            self._active_pl_key, self._active_row_id = self._selected_row_id(self.tbl_fail)
-            self._refresh_candidates_panel()
+    def on_repair_selected(self):
+        if not (self.tbl_repair.selectionModel() and self.tbl_repair.selectionModel().hasSelection()):
+            return
+        self._active_pl_key, self._active_row_id = self._selected_row_id(self.tbl_repair)
+        vis_row = self._selected_visual_row(self.tbl_repair)
+        self._active_target = None
+        if vis_row is not None:
+            item = self.tbl_repair.item(vis_row, 0)
+            data = item.data(Qt.UserRole) if item else None
+            if isinstance(data, dict):
+                self._active_target = str(data.get("bucket") or "") or None
+        self._refresh_candidates_panel()
 
     def on_browse_choice(self):
         if self._active_target is None or self._active_row_id is None or self._active_pl_key is None:
-            QMessageBox.warning(self, "No selection", "Please select a row from AMBIGUOUS or FAILED first.")
+            QMessageBox.warning(self, "No selection", "Please select a row from the repair list first.")
             return
 
-        file, _ = QFileDialog.getOpenFileName(self, "Pick the correct audio file", "", "Audio files (*.*)")
+        file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Pick the correct audio file",
+            "",
+            "Audio files (*.mp3 *.aac *.ogg *.opus *.mp4 *.m4a *.flac *.alac *.wav *.aif *.aiff *.aifc *.ape *.wv *.dsf *.dff);;All files (*.*)",
+        )
         if not file:
             return
 
         self.lst_candidates.clear()
-        self.lst_candidates.addItem(QListWidgetItem(file))
+        item = QListWidgetItem(file)
+        item.setData(Qt.UserRole, file)
+        self.lst_candidates.addItem(item)
         self.lst_candidates.setCurrentRow(0)
 
     def on_apply_choice(self):
         if self._active_target is None or self._active_row_id is None or self._active_pl_key is None:
-            QMessageBox.warning(self, "No selection", "Please select a row from AMBIGUOUS or FAILED first.")
+            QMessageBox.warning(self, "No selection", "Please select a row from the repair list first.")
             return
 
         chosen = self._current_candidate()
@@ -1181,17 +1425,23 @@ class MainWindow(QMainWindow):
 
         # only in-memory, do NOT persist to disk here
         self._selections_by_key.setdefault(pl_key, {})[row_id] = chosen
+        self._dirty_selection_ids.add((pl_key, row_id))
+        self._selection_origin[(pl_key, row_id)] = self._view_mode
 
         tag = "[SELECTED]" if self._active_target == "AMBIGUOUS" else "[RESCUED]"
-        table = self.tbl_amb if self._active_target == "AMBIGUOUS" else self.tbl_fail
+        table = self.tbl_repair
 
         vis_row = self._selected_visual_row(table)
         if vis_row is not None:
-            # overwrite Notes (works in both modes)
+            # Apply changes only this row in place. No re-sort or row movement.
+            status_item = QTableWidgetItem("✓")
+            status_item.setTextAlignment(Qt.AlignCenter)
+            status_item.setData(Qt.UserRole, {"bucket": self._active_target})
+            table.setItem(vis_row, 0, status_item)
             if self._view_mode == "RESOLVED":
-                table.setItem(vis_row, 3, QTableWidgetItem(f"[MANUAL] {chosen}"))
+                table.setItem(vis_row, 4, QTableWidgetItem(f"[MANUAL] {chosen}"))
             else:
-                table.setItem(vis_row, 3, QTableWidgetItem(f"{tag} {chosen}"))
+                table.setItem(vis_row, 4, QTableWidgetItem(f"{tag} {chosen}"))
 
         self.status_label.setText(f"Applied (not saved): key={pl_key} row={row_id}")
 
@@ -1227,9 +1477,32 @@ class MainWindow(QMainWindow):
                 continue
 
             out_m3u = self.runner.export_path_for(self.reports_path, pl)
-            selections = self._selections_by_key.get(pl_key, {}) or {}
+            # Take a detached snapshot so the worker receives exactly the choices
+            # visible at the moment Save is pressed.  Also attach original-path
+            # fallbacks: this protects manual repairs if a report row id is read
+            # with a different textual form (for example 1 vs 1.0).
+            selections = dict(self._selections_by_key.get(pl_key, {}) or {})
+            rows_by_id = {
+                str(r.get("row_index", r.get("_i", ""))).strip(): r
+                for r in (self._report_rows_by_key.get(pl_key, []) or [])
+            }
+            selection_records = []
+            for selected_row_id, selected_path in selections.items():
+                rr = rows_by_id.get(str(selected_row_id).strip(), {})
+                selection_records.append({
+                    "row_index": str(selected_row_id).strip(),
+                    "original_path": self._safe_str(rr.get("original_path") or rr.get("original") or ""),
+                    "chosen_path": str(selected_path),
+                })
 
-            jobs.append({"report_csv": str(report_csv), "out_m3u": str(out_m3u), "selections": selections})
+            jobs.append({
+                "report_csv": str(report_csv),
+                "out_m3u": str(out_m3u),
+                "selections": selections,
+                "selection_records": selection_records,
+                "index_path": str(self.index_path),
+                "source_playlist": str(pl),
+            })
             pending_keys.append(pl_key)
 
         if not jobs:
@@ -1328,9 +1601,25 @@ class MainWindow(QMainWindow):
             f"Target: {self._active_target} | key={self._active_pl_key} | row={self._active_row_id} | {extinf}"
         )
 
-        cands = r.get("candidates", []) or []
+        cands = list(r.get("candidates", []) or [])
 
-        if self._active_target == "FAILED":
+        # In Resolved, show the current manual choice rather than visually
+        # reverting to the report's original automatic candidate.  The table row
+        # already contains the merged manual state; mirror that state here.
+        current_manual = None
+        in_memory = (self._selections_by_key.get(self._active_pl_key, {}) or {}).get(self._active_row_id)
+        if in_memory and (
+            self._view_mode != "RESOLVED"
+            or self._selection_origin.get((self._active_pl_key, self._active_row_id)) == "RESOLVED"
+        ):
+            current_manual = in_memory
+        if not current_manual and self._active_pl_key in self._persisted_progress_keys:
+            current_manual = (self._load_selections_for_key(self._active_pl_key) or {}).get(self._active_row_id)
+        if current_manual:
+            current_manual = str(current_manual)
+            cands = [current_manual] + [p for p in cands if str(p) != current_manual]
+
+        if self._active_target == "FAILED" and not current_manual:
             self.lst_candidates.addItem(QListWidgetItem("(No candidates. Use Browse…)"))
             return
 
@@ -1339,7 +1628,9 @@ class MainWindow(QMainWindow):
             return
 
         for p in cands:
-            self.lst_candidates.addItem(QListWidgetItem(p))
+            item = QListWidgetItem(p)
+            item.setData(Qt.UserRole, p)
+            self.lst_candidates.addItem(item)
         self.lst_candidates.setCurrentRow(0)
 
     def _selected_visual_row(self, table: QTableWidget) -> int | None:
@@ -1356,7 +1647,7 @@ class MainWindow(QMainWindow):
         if vis_row is None:
             return None, None
 
-        item0 = table.item(vis_row, 0)
+        item0 = table.item(vis_row, 1)
         if not item0:
             return None, None
 
@@ -1372,10 +1663,15 @@ class MainWindow(QMainWindow):
         return str(pl_key), str(row_id)
 
     def _current_candidate(self) -> str:
-        it = self.lst_candidates.currentItem()
+        # Prefer the explicitly selected item.  currentItem() can remain on row 0
+        # in some Qt focus transitions (for example after clicking Apply), which
+        # made Ambiguous repairs silently use the first candidate.
+        selected = self.lst_candidates.selectedItems()
+        it = selected[0] if selected else self.lst_candidates.currentItem()
         if not it:
             return ""
-        txt = (it.text() or "").strip()
+        data_path = it.data(Qt.UserRole)
+        txt = str(data_path if data_path else (it.text() or "")).strip()
         if txt.startswith("("):
             return ""
         return txt
@@ -1438,15 +1734,12 @@ class MainWindow(QMainWindow):
                 for entry in self.music_roots:
                     key = str(Path(entry.get("path", "")))
                     if key in scanned_paths:
-                        if key in successful:
-                            entry["imported"] = True
-                            kept.append(entry)
-                        # Scanned but indexed zero: remove automatically.
-                    else:
-                        # Disabled roots were not part of this rebuild. Keep only
-                        # roots that had already been confirmed by an earlier scan.
-                        if entry.get("imported", False):
-                            kept.append(entry)
+                        # Keep the folder visible even if this scan found zero
+                        # tracks. It may be temporarily unavailable, empty, or
+                        # contain files the scanner cannot currently read.
+                        entry["imported"] = key in successful
+                        entry["index_missing"] = False
+                    kept.append(entry)
 
                 self.music_roots = kept
                 self._save_music_roots()
@@ -1464,7 +1757,7 @@ class MainWindow(QMainWindow):
                 if preserved_indexed:
                     msg += f"; retained from other indexed roots: {preserved_indexed}"
                 if rejected:
-                    msg += f"; removed empty/unreadable selected roots: {rejected}"
+                    msg += f"; empty/unreadable roots kept as Pending: {rejected}"
                 self.status_label.setText(msg)
                 QMessageBox.information(self, "Scan Complete", msg)
                 return
@@ -1514,6 +1807,15 @@ class MainWindow(QMainWindow):
                         self._save_selections_for_key(pl_key, sel)
                         self._saved_keys.add(pl_key)
                         self._persisted_progress_keys.add(pl_key)
+                        self._provisional_reset_keys.discard(pl_key)
+                        self._dirty_selection_ids = {
+                            key for key in self._dirty_selection_ids if key[0] != pl_key
+                        }
+                        self._selection_origin = {
+                            key: origin
+                            for key, origin in self._selection_origin.items()
+                            if key[0] != pl_key
+                        }
                     self._pending_save_keys = []
                     self._pending_save_sources = {}
                     self._pending_save_outputs = {}
@@ -1539,27 +1841,52 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", err)
 
     def _fill_table(self, table: QTableWidget, rows: list[dict]):
-        table.setRowCount(0)
+        """Fill the repair table efficiently, including large Resolved views."""
+        sorting = table.isSortingEnabled()
+        old_updates = table.updatesEnabled()
+        old_blocked = table.blockSignals(True)
+        table.setSortingEnabled(False)
+        table.setUpdatesEnabled(False)
+        table.setRowCount(len(rows))
 
-        for r in rows:
-            vis_row = table.rowCount()
-            table.insertRow(vis_row)
+        try:
+            for vis_row, r in enumerate(rows):
+                playlist = str(r.get("playlist", ""))
+                pl_key = str(r.get("pl_key", ""))
+                row_id = str(r.get("row_index", "")).strip()
+                bucket = str(r.get("_bucket", ""))
+                extinf = str(r.get("extinf_display", ""))
+                orig = str(r.get("original_path", ""))
+                notes = str(r.get("notes", ""))
 
-            playlist = str(r.get("playlist", ""))
-            pl_key = str(r.get("pl_key", ""))
-            row_id = str(r.get("row_index", "")).strip()
+                dirty = (pl_key, row_id) in self._dirty_selection_ids
+                if dirty:
+                    symbol = "✓"
+                elif self._view_mode == "RESOLVED":
+                    symbol = ""
+                elif bucket == "AMBIGUOUS":
+                    symbol = "△"
+                elif bucket == "FAILED":
+                    symbol = "✕"
+                else:
+                    symbol = ""
 
-            extinf = str(r.get("extinf_display", ""))
-            orig = str(r.get("original_path", ""))
-            notes = str(r.get("notes", ""))
+                status_item = QTableWidgetItem(symbol)
+                status_item.setTextAlignment(Qt.AlignCenter)
+                status_item.setData(Qt.UserRole, {"bucket": bucket})
+                table.setItem(vis_row, 0, status_item)
 
-            it0 = QTableWidgetItem(playlist)
-            it0.setData(Qt.UserRole, {"pl_key": pl_key, "row_id": row_id})
-            table.setItem(vis_row, 0, it0)
-
-            table.setItem(vis_row, 1, QTableWidgetItem(extinf))
-            table.setItem(vis_row, 2, QTableWidgetItem(orig))
-            table.setItem(vis_row, 3, QTableWidgetItem(notes))
+                it1 = QTableWidgetItem(playlist)
+                it1.setData(Qt.UserRole, {"pl_key": pl_key, "row_id": row_id})
+                table.setItem(vis_row, 1, it1)
+                table.setItem(vis_row, 2, QTableWidgetItem(extinf))
+                table.setItem(vis_row, 3, QTableWidgetItem(orig))
+                table.setItem(vis_row, 4, QTableWidgetItem(notes))
+        finally:
+            table.blockSignals(old_blocked)
+            table.setUpdatesEnabled(old_updates)
+            table.setSortingEnabled(sorting)
+            table.viewport().update()
 
     def _norm(self, s: str) -> str:
         s = (s or "").strip().lower()
@@ -1625,13 +1952,30 @@ class MainWindow(QMainWindow):
         self._ambiguous_rows = [r for r in (self._ambiguous_rows_all or []) if self._row_matches_query(r, q)]
         self._failed_rows = [r for r in (self._failed_rows_all or []) if self._row_matches_query(r, q)]
 
+        for r in self._ambiguous_rows:
+            r.setdefault("_bucket", "AMBIGUOUS")
+        for r in self._failed_rows:
+            r["_bucket"] = "FAILED"
+
         self._rebuild_row_maps()
-        self._fill_table(self.tbl_amb, self._ambiguous_rows)
-        self._fill_table(self.tbl_fail, self._failed_rows)
+        if self._view_mode == "RESOLVED":
+            # Resolved is an audit view, so preserve the original playlist row
+            # order instead of grouping manual Ambiguous/Failed origins ahead
+            # of automatic results.
+            visible_rows = sorted(
+                self._ambiguous_rows + self._failed_rows,
+                key=lambda r: (
+                    int(r.get("_playlist_order", 0)),
+                    int(r.get("_row_order", 10**12)),
+                ),
+            )
+        else:
+            # Unresolved intentionally shows Ambiguous before Failed.
+            visible_rows = self._ambiguous_rows + self._failed_rows
+        self._fill_table(self.tbl_repair, visible_rows)
 
         # optional: clear selection after filtering to avoid stale row_id
-        self.tbl_amb.clearSelection()
-        self.tbl_fail.clearSelection()
+        self.tbl_repair.clearSelection()
         self.lst_candidates.clear()
         self._active_target = None
         self._active_pl_key = None

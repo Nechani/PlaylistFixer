@@ -91,15 +91,23 @@ Music Roots 是 Playlist Fixer 已建立索引的音樂資料夾清單。
 
 每個路徑前方都有核取方塊。
 
-核取方塊只控制：
+核取方塊控制：
 
-> Repair 可以從哪些 Music Roots 尋找候選檔案。
+> Repair 可以從哪些 Music Roots 尋找及使用音樂檔案。
+
+這個範圍也適用於原播放清單中仍然存在的舊路徑。若舊路徑不在目前勾選的 Music Roots 中，Repair 不會直接保留該路徑，而會只在已勾選的範圍內重新尋找。
 
 核取方塊不控制掃描，也不會刪除既有索引。
 
-### Add Music Folder
+Music Roots 清單會依 Windows 使用者與電腦分開保存。重新啟動程式，或外接硬碟暫時未連接時，路徑仍會保留；只有使用 `Remove Selected` 或 `Clear All` 才會移除。\n\n把程式資料夾搬到另一台電腦時，不會自動帶入上一台電腦的 Music Roots。程式資料夾內的舊索引也不會自行新增路徑到目前電腦的清單。
 
-新增一個包含音樂檔案的資料夾。
+Music Roots 與下方歌曲清單之間的分隔線可以拖曳，用來調整路徑清單的顯示高度。
+
+### Add Music Folders
+
+新增一個或多個包含音樂檔案的資料夾。
+
+每次會開啟 Windows 原生資料夾選擇視窗。選完一個資料夾後，可繼續加入其他資料夾；已存在的路徑不會重複新增。
 
 剛加入、尚未掃描的資料夾會顯示：
 
@@ -146,10 +154,18 @@ Repair 不會直接覆蓋原歌單，也不會在未儲存時正式寫入修復�
 
 ### View：Unresolved／Resolved
 
-- **Unresolved**：尚未處理、候選不明確或找不到檔案的歌曲
-- **Resolved**：已保留、已自動修復或已手動指定的歌曲
+- **Unresolved**：尚未 Repair、候選不明確、找不到檔案，或已手動修正但尚未 Save 的歌曲
+- **Resolved**：已保留、已自動修復，或已正式儲存手動選擇的歌曲
 
-Resolved 不只是完成清單，也是一個檢查區。若程式自動選錯，仍可在此重新指定正確檔案。
+Unresolved 會將 Ambiguous 與 Failed 顯示在同一張表格中：
+
+- `△`：Ambiguous，找到可能候選，但需要人工確認
+- `✕`：Failed，沒有找到可靠候選，需要使用 Browse 手動尋找
+- `✓`：已手動修正，但尚未 Save
+
+預設會先顯示 `△`，再顯示 `✕`。按下 Apply 後，歌曲會在原本的位置改為 `✓`，不會立即移到 Resolved；按下 Save 後才正式移動。
+
+Resolved 不只是完成清單，也是一個檢查區。若程式自動選錯，仍可在此重新指定正確檔案。Resolved 中的手動修改在 Save 前也會暫時顯示 `✓`。
 
 ### Candidates
 
@@ -163,7 +179,11 @@ Resolved 不只是完成清單，也是一個檢查區。若程式自動選錯�
 
 套用目前選擇。
 
-Apply 後的內容在按下 Save 之前仍屬於本次工作階段的暫存狀態。
+在 Unresolved 中按下 Apply 後，該列會在原本位置顯示 `✓`，但不會立即移到 Resolved。
+
+在 Resolved 中重新修改後，該列也會暫時顯示 `✓`。
+
+這些內容在按下 Save 之前仍屬於本次工作階段的暫存狀態。
 
 ### Save Fixed Playlist
 
@@ -175,13 +195,14 @@ Apply 後的內容在按下 Save 之前仍屬於本次工作階段的暫存狀�
 
 ### 4.1 第一次建立音樂索引
 
-1. 按下 `Add Music Folder`
+1. 按下 `Add Music Folders`
 2. 選擇包含音樂檔案的資料夾
-3. 新路徑會顯示 `[Pending scan]`
-4. 按下 `Scan New Folders`
-5. 掃描成功後，該路徑會成為正式 Music Root
+3. 需要時繼續加入其他資料夾
+4. 新路徑會顯示 `[Pending scan]`
+5. 按下 `Scan New Folders`
+6. 掃描成功後，該路徑會成為正式 Music Root
 
-若資料夾不存在、無法讀取，或沒有找到任何支援的音樂檔案，程式不會把它當成有效 Music Root 長期保存。
+新加入的路徑會保存於 Music Roots 清單中。即使資料夾暫時不存在、外接硬碟尚未連接、無法讀取，或掃描結果為 0，路徑也不會自動消失。
 
 ### 4.2 之後新增另一個音樂資料夾
 
@@ -200,7 +221,7 @@ E:\New Music
 
 只需要：
 
-1. Add Music Folder
+1. Add Music Folders
 2. 選擇 `E:\New Music`
 3. 按 `Scan New Folders`
 
@@ -225,9 +246,9 @@ E:\New Music
 ☐ D:\DAP Music
 ```
 
-Repair 只會從 `C:\PC Music` 尋找候選。
+Repair 只會從 `C:\PC Music` 尋找及使用檔案。
 
-`D:\DAP Music` 仍保留在索引中，只是本次 Repair 不會使用它。
+`D:\DAP Music` 仍保留在索引中，只是本次 Repair 不會使用它。即使原播放清單中的某個 `D:\DAP Music` 路徑目前仍存在，只要該 Music Root 沒有勾選，Repair 也不會直接保留那個路徑。
 
 這可以避免：
 
@@ -282,7 +303,7 @@ Roon XLSX 可包含：
 - External ID
 - Path
 
-即使 XLSX 來自另一台電腦、原始磁碟代號和資料夾結構不同，Playlist Fixer 仍會嘗試使用 metadata 與目前音樂索引進行配對。
+即使 XLSX 來自另一台電腦、原始磁碟代號和資料夾結構不同，Playlist Fixer 仍會嘗試使用 metadata 與目前音樂索引進行配對。\n\nRoon XLSX 修復後會輸出為標準 M3U。輸出時會利用 XLSX 中可靠的 Track Artist、Album Artist 與 Title 建立 `#EXTINF`，避免修復後的歌單只剩路徑而失去一般 M3U 所需的歌曲資訊。若無法取得時長，會使用 `-1`；一般播放器仍可正常讀取。
 
 ### Roon M3U
 
@@ -323,7 +344,7 @@ Repair 後，歌曲可能出現以下狀態：
 
 ### Kept original
 
-原始路徑目前仍然有效，不需要修改。
+原始路徑目前仍然有效，而且位於已勾選的 Music Roots 範圍內，因此不需要修改。
 
 ### Auto repaired
 
@@ -333,13 +354,17 @@ Repair 後，歌曲可能出現以下狀態：
 
 使用者已自行選擇正確檔案。
 
-### Ambiguous
+### Ambiguous（`△`）
 
-找到多個合理候選，但無法安全判斷哪一個正確。
+找到一個或多個合理候選，但無法安全判斷哪一個正確，需要使用者確認。
 
-### Failed
+### Failed（`✕`）
 
-沒有找到足夠可靠的候選。
+沒有找到足夠可靠的候選，需要使用 Browse 手動尋找正確檔案。
+
+### Manually fixed, not saved（`✓`）
+
+使用者已經套用手動選擇，但尚未 Save。這是暫存狀態。
 
 ---
 
@@ -350,9 +375,14 @@ Repair 後，歌曲可能出現以下狀態：
 包含：
 
 - 尚未 Repair 的歌曲
-- Ambiguous
-- Failed
+- `△` Ambiguous
+- `✕` Failed
 - 尚未套用選擇的歌曲
+- 已手動修正但尚未 Save 的 `✓` 歌曲
+
+Ambiguous 與 Failed 會顯示在同一張表格中，預設以 `△` 為優先，再顯示 `✕`。
+
+按下 Apply 後，歌曲會留在原本位置並改為 `✓`，避免清單跳動。按下 Save 後，`✓` 歌曲才會正式移到 Resolved。
 
 ### Resolved
 
@@ -360,9 +390,9 @@ Repair 後，歌曲可能出現以下狀態：
 
 - Kept original
 - Auto repaired
-- Manual selection
+- 已正式儲存的 Manual selection
 
-Resolved 仍可以重新修改。
+Resolved 仍可以重新修改。修改後會暫時顯示 `✓`，Save 後記號消失。
 
 例如自動配對到錯誤版本：
 
@@ -378,11 +408,12 @@ Resolved 仍可以重新修改。
 
 ## 9. 手動處理 Ambiguous
 
-1. 在 Unresolved 中選取 Ambiguous 項目
+1. 在 Unresolved 中選取帶有 `△` 的 Ambiguous 項目
 2. 查看 Candidates
 3. 選擇正確檔案
 4. 按下 Apply
-5. 該歌曲會移至 Resolved
+5. 該歌曲會留在原本位置，狀態改為 `✓`
+6. 按下 `Save Fixed Playlist` 後，才正式移至 Resolved
 
 請特別檢查：
 
@@ -397,11 +428,12 @@ Resolved 仍可以重新修改。
 
 ## 10. 手動處理 Failed
 
-1. 在 Unresolved 中選取 Failed 項目
+1. 在 Unresolved 中選取帶有 `✕` 的 Failed 項目
 2. 按下 Browse
-3. 選擇正確音樂檔
+3. 手動尋找並選擇正確音樂檔
 4. 按下 Apply
-5. 該歌曲會移至 Resolved
+5. 該歌曲會留在原本位置，狀態改為 `✓`
+6. 按下 `Save Fixed Playlist` 後，才正式移至 Resolved
 
 若音樂檔案實際上不存在，則無法修復。
 
@@ -416,10 +448,13 @@ Resolved 仍可以重新修改。
 按下 Repair 後：
 
 - 自動修復結果會顯示
-- 手動 Apply 的內容會保留
+- Ambiguous 會標記為 `△`
+- Failed 會標記為 `✕`
+- 手動 Apply 後會標記為 `✓`
+- `✓` 會保留在原本位置
 - 但尚未形成正式進度
 
-若在沒有 Save 的情況下離開該歌單，再重新匯入原始歌單，程式會把它視為未正式修復。
+若在沒有 Save 的情況下離開該歌單，再重新匯入原始歌單，程式會把它視為未正式修復。\n\n若再次執行 Repair 並確認重新掃描，目前畫面會進入一套新的暫存結果；舊的已儲存進度不會混入新的 Unresolved／Resolved 顯示。只有再次 Save 後，新的結果才成為目前正式進度。
 
 ### Save 才會建立正式進度
 
@@ -429,6 +464,8 @@ Resolved 仍可以重新修改。
 - 保存 Repair 報告
 - 保存手動選擇
 - 保存尚未完成的修復進度
+- Unresolved 中的 `✓` 項目正式移到 Resolved
+- Resolved 中未儲存的 `✓` 記號消失
 - 下次可以繼續處理
 
 ### 原始歌單與修復歌單分開記錄
@@ -498,7 +535,7 @@ Playlist Fixer 會建立修復報告與進度資料，例如：
 
 ## 14. 常見問題
 
-### 為什麼 Add Music Folder 後還顯示 Pending scan？
+### 為什麼 Add Music Folders 後還顯示 Pending scan？
 
 因為尚未建立索引。按下 `Scan New Folders` 後，掃描成功才會成為正式 Music Root。
 
@@ -512,7 +549,15 @@ Playlist Fixer 會建立修復報告與進度資料，例如：
 
 ### 取消 Music Root 的勾選會刪除資料嗎？
 
-不會。只會讓 Repair 暫時不使用該音樂庫。
+不會。只會讓 Repair 暫時不使用該音樂庫，也不會保留該範圍內的原始路徑。
+
+### 為什麼原播放清單中的路徑明明存在，Repair 還是改用其他位置？
+
+因為該原始路徑不在目前勾選的 Music Roots 中。Repair 只會使用勾選範圍內的檔案。
+
+### 為什麼外接硬碟未連接時，Music Roots 路徑仍然存在？
+
+Music Roots 清單會依目前 Windows 使用者與電腦分開保存。外接硬碟暫時離線不會刪除設定；只有使用 `Remove Selected` 或 `Clear All` 才會移除。\n\n### 把程式搬到另一台電腦時，為什麼不會顯示上一台電腦的 Music Roots？\n\nMusic Roots 是每台電腦各自保存的設定。程式資料夾裡的索引只用來判斷目前已設定路徑的索引狀態，不會自動把上一台電腦的路徑加入目前清單。
 
 ### 為什麼匯入後所有歌曲都在 Unresolved？
 
@@ -535,6 +580,10 @@ Playlist Fixer 會建立修復報告與進度資料，例如：
 可以。Playlist Fixer 會使用 Roon XLSX 的 metadata，而不只依賴原始絕對路徑。
 
 但若音樂標籤缺失、歌曲版本太多或資料差異太大，仍可能需要人工確認。
+
+### 為什麼 Apply 後歌曲沒有立刻移到 Resolved？
+
+因為 Apply 只代表已套用暫存修改。歌曲會顯示 `✓` 並留在原本位置，按下 Save 後才正式移到 Resolved。\n\n### 為什麼再次按 Repair (Safe) 會跳出確認？\n\n再次 Repair 會清除本次尚未儲存的自動結果與 `✓` 手動修改，並使用目前勾選的 Music Roots 從頭重新分析，因此程式會先要求確認。已經儲存的舊輸出檔不會被刪除。
 
 ### 為什麼 Repair 後重新開啟又顯示未修復？
 
@@ -604,10 +653,12 @@ Playlist Fixer：
 
 1. 保留原始播放清單備份
 2. 先用較小的測試歌單確認 Music Roots
-3. Repair 後檢查 Resolved
-4. 對 Ambiguous 不要只看檔名
-5. Save 後先在播放器中測試新歌單
-6. 確認無誤後再處理大型歌單
+3. Repair 後檢查 Unresolved 與 Resolved
+4. 優先處理 `△` Ambiguous，再處理需要手動尋找的 `✕` Failed
+5. 對 Ambiguous 不要只看檔名
+6. 儲存前確認 `✓` 項目
+7. Save 後先在播放器中測試新歌單
+8. 確認無誤後再處理大型歌單
 
 ---
 

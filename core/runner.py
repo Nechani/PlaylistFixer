@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any
 import json
 import csv
+import re
 
 from core.paths import stats_path as stats_path_fn
 from core.vendor.playlist_scan_safe import scan_folder
@@ -505,6 +506,7 @@ class TaskRunner:
                 format_mode=format_mode,
                 strict_ext=strict_ext,
                 format_priority_list=format_priority_list,
+                allowed_roots=[str(r) for r in enabled_roots] if enabled_roots else None,
             )
            
             # 清 tmp_xlsx 轉出來的 m3u
@@ -545,6 +547,72 @@ class TaskRunner:
                 "failed": all_fail,
             },
         )
+
+    def _xlsx_export_metadata(self, xlsx_path: Path) -> Dict[str, dict]:
+        """Return row-indexed reliable metadata from a Roon XLSX export.
+
+        The row indexes match the playlist/report order (0-based, excluding the
+        header).  This is used only when exporting an XLSX-derived repair result
+        to M3U, so the structured Title/Artist data is not lost.
+        """
+        result: Dict[str, dict] = {}
+        if xlsx_path.suffix.lower() != ".xlsx" or not xlsx_path.exists():
+            return result
+
+        wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            rows = ws.iter_rows(values_only=True)
+            header = next(rows, None)
+            if not header:
+                return result
+            header_map = {str(h).strip().lower(): i for i, h in enumerate(header) if h is not None}
+
+            def cell(row, *names):
+                for name in names:
+                    idx = header_map.get(name.lower())
+                    if idx is not None and idx < len(row):
+                        value = row[idx]
+                        if value is not None and str(value).strip():
+                            return str(value).strip()
+                return ""
+
+            output_index = 0
+            for row in rows:
+                if not row:
+                    continue
+                path_value = cell(row, "Path")
+                if not path_value:
+                    continue
+
+                artist = cell(row, "Track Artist(s)", "Album Artist")
+                # Roon sometimes exports the same artist twice, e.g.
+                # "NEFFEX / NEFFEX". Remove exact duplicates without changing
+                # genuine collaborations.
+                if artist:
+                    parts = [part.strip() for part in artist.split(" / ") if part.strip()]
+                    unique_parts = []
+                    seen = set()
+                    for part in parts:
+                        key = part.casefold()
+                        if key not in seen:
+                            seen.add(key)
+                            unique_parts.append(part)
+                    artist = " / ".join(unique_parts)
+
+                result[str(output_index)] = {
+                    "title": cell(row, "Title"),
+                    "artist": artist,
+                    "album_artist": cell(row, "Album Artist"),
+                    "album": cell(row, "Album"),
+                    "disc": cell(row, "Disc#"),
+                    "track": cell(row, "Track#"),
+                    "original_path": path_value,
+                }
+                output_index += 1
+        finally:
+            wb.close()
+        return result
 
     # -------------------------
     # Save/Export phase (final playlist output)
@@ -603,30 +671,157 @@ class TaskRunner:
 
             report_csv = Path(job["report_csv"])
             out_m3u = Path(job["out_m3u"])
-            selections: Dict[str, str] = job.get("selections", {}) or {}
+            selections: Dict[str, str] = {
+                str(k).strip(): str(v)
+                for k, v in (job.get("selections", {}) or {}).items()
+            }
+            selection_records = job.get("selection_records", []) or []
+
+            def normalized_row_id(value: object) -> str:
+                text = str(value if value is not None else "").strip()
+                if not text:
+                    return ""
+                try:
+                    number = float(text)
+                    if number.is_integer():
+                        return str(int(number))
+                except (TypeError, ValueError):
+                    pass
+                return text
+
+            # Normalize ids and keep an original-path fallback.  Manual choices
+            # must always override report output, including Failed and Resolved
+            # rows and Ambiguous choices other than candidate 1.
+            selections_by_id = {normalized_row_id(k): v for k, v in selections.items()}
+            selections_by_original: Dict[str, str] = {}
+            for record in selection_records:
+                if not isinstance(record, dict):
+                    continue
+                chosen_path = str(record.get("chosen_path", "")).strip()
+                original_path = str(record.get("original_path", "")).strip()
+                row_id = normalized_row_id(record.get("row_index", ""))
+                if chosen_path and row_id:
+                    selections_by_id[row_id] = chosen_path
+                if chosen_path and original_path:
+                    selections_by_original[original_path.casefold()] = chosen_path
+
+            # Build a path -> indexed metadata lookup once per export job.
+            # This lets us enrich missing or incomplete standard EXTINF data without
+            # reopening every audio file during Save. Existing good EXTINF text is
+            # preserved exactly.
+            metadata_by_path: Dict[str, dict] = {}
+            index_path_value = str(job.get("index_path", "") or "").strip()
+            if index_path_value:
+                try:
+                    raw_index = json.loads(Path(index_path_value).read_text(encoding="utf-8"))
+                    if isinstance(raw_index, list):
+                        for item in raw_index:
+                            if not isinstance(item, dict):
+                                continue
+                            path_value = str(item.get("path", "") or "").strip()
+                            if path_value:
+                                metadata_by_path[path_value.casefold()] = item
+                except Exception:
+                    metadata_by_path = {}
+
+            # Roon XLSX has structured metadata that ordinary M3U files do not.
+            # Preserve it when exporting to M3U instead of reducing the result to
+            # path-only lines.  Ordinary M3U/M3U8 behavior remains unchanged.
+            xlsx_metadata_by_row: Dict[str, dict] = {}
+            source_playlist_value = str(job.get("source_playlist", "") or "").strip()
+            if source_playlist_value:
+                try:
+                    source_playlist = Path(source_playlist_value)
+                    if source_playlist.suffix.lower() == ".xlsx":
+                        xlsx_metadata_by_row = self._xlsx_export_metadata(source_playlist)
+                except Exception:
+                    xlsx_metadata_by_row = {}
+
+            extinf_re = re.compile(r"^#EXTINF:\s*(-?\d+)\s*,\s*(.*)$", re.IGNORECASE)
+
+            def build_extinf(existing: str, output_path: str, row_index: str = "") -> str:
+                """Preserve good original EXTINF; fill only missing facts.
+
+                Rules:
+                - A valid EXTINF with a non-negative duration and non-empty display
+                  is returned unchanged.
+                - If only duration is missing/negative, keep the original display
+                  and fill duration from indexed metadata when available.
+                - If EXTINF is absent or display text is empty, construct standard
+                  Artist - Title text only from reliable indexed metadata.
+                - Never invent artist/title. If metadata is insufficient, fall back
+                  to the file stem as display text.
+                """
+                existing = (existing or "").strip()
+                metadata = metadata_by_path.get((output_path or "").casefold(), {})
+                xlsx_metadata = xlsx_metadata_by_row.get(normalized_row_id(row_index), {})
+                duration = metadata.get("duration")
+                try:
+                    duration_int = int(round(float(duration))) if duration not in (None, "") else None
+                except (TypeError, ValueError):
+                    duration_int = None
+
+                title = str(metadata.get("title", "") or "").strip()
+                artist = str(metadata.get("artist", "") or "").strip()
+
+                # If the repaired target is outside the active index, retain the
+                # trustworthy metadata supplied by the original Roon XLSX.
+                if not title:
+                    title = str(xlsx_metadata.get("title", "") or "").strip()
+                if not artist:
+                    artist = str(
+                        xlsx_metadata.get("artist", "")
+                        or xlsx_metadata.get("album_artist", "")
+                        or ""
+                    ).strip()
+
+                match = extinf_re.match(existing) if existing else None
+                if match:
+                    old_duration = int(match.group(1))
+                    display = match.group(2).strip()
+                    if old_duration >= 0 and display:
+                        return existing
+                    if display:
+                        effective_duration = duration_int if duration_int is not None else old_duration
+                        return f"#EXTINF:{effective_duration},{display}"
+
+                if artist and title:
+                    display = f"{artist} - {title}"
+                elif title:
+                    display = title
+                else:
+                    display = Path(output_path).stem if output_path else ""
+
+                if not display:
+                    return existing
+                effective_duration = duration_int if duration_int is not None else -1
+                return f"#EXTINF:{effective_duration},{display}"
 
             rows = self._read_report_rows(report_csv)
             lines = ["#EXTM3U"]
 
             for r in rows:
-                row_index = str(r.get("row_index", r.get("_i", ""))).strip()
+                row_index = normalized_row_id(r.get("row_index", r.get("_i", "")))
                 extinf_line = (r.get("extinf_line") or r.get("extinf") or "").strip()
                 orig = (r.get("original_path") or r.get("original") or "").strip()
                 status = (r.get("status") or "").strip()
 
                 final_path = pick_final(r)
-                chosen = selections.get(row_index) if row_index else None
-
-                if extinf_line:
-                    lines.append(extinf_line)
+                chosen = selections_by_id.get(row_index) if row_index else None
+                if not chosen and orig:
+                    chosen = selections_by_original.get(orig.casefold())
 
                 if chosen:
-                    lines.append(chosen)
+                    output_path = chosen
+                elif is_resolved_status(status):
+                    output_path = final_path or orig
                 else:
-                    if is_resolved_status(status):
-                        lines.append(final_path or orig)
-                    else:
-                        lines.append(orig)
+                    output_path = orig
+
+                enriched_extinf = build_extinf(extinf_line, output_path, row_index)
+                if enriched_extinf:
+                    lines.append(enriched_extinf)
+                lines.append(output_path)
 
             out_m3u.parent.mkdir(parents=True, exist_ok=True)
             out_m3u.write_text("\n".join(lines) + "\n", encoding="utf-8")

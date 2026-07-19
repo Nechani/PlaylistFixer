@@ -91,15 +91,31 @@ Music Roots is the list of music folders already indexed by Playlist Fixer.
 
 Each path has a checkbox.
 
-The checkbox controls only:
+The checkbox controls:
 
-> Which Music Roots Repair is allowed to search.
+> Which Music Roots Repair is allowed to search and use.
+
+This scope also applies to an original playlist path that still exists. If the original path is outside the checked Music Roots, Repair does not keep it automatically and searches only within the checked scope.
 
 The checkbox does not control scanning and does not delete an existing index.
 
-### Add Music Folder
+Music Roots are stored separately for each Windows user and computer. Restarting the program or temporarily disconnecting an external drive does not remove them. Only `Remove Selected` or `Clear All` removes them.
 
-Adds a folder containing audio files.
+Moving the program folder to another computer does not import the previous computer's Music Roots. Old index data inside the program folder cannot add paths to the current computer's list.
+
+The splitter between Music Roots and the track list can be dragged to change the height of the Music Roots area.
+
+### Add Music Folders
+
+Adds one or more folders containing audio files.
+
+The normal Windows folder picker is used. After selecting one folder, you may continue adding more. Existing paths are not added twice.
+
+A Music Root may show one of these states:
+
+- `[Pending scan]`: newly added and not indexed yet
+- `[Index missing]`: the path exists, but index data is missing or has not been created
+- `[Unavailable]`: the folder or external drive is currently unavailable
 
 A newly added folder that has not yet been scanned is marked:
 
@@ -142,14 +158,26 @@ For clarity, it is recommended to process one playlist at a time, save it, and t
 
 Analyzes the current playlist and tries to locate the correct file for each entry.
 
+The first Repair runs immediately. If Repair has already been run for the same playlist, clicking `Repair (Safe)` again asks for confirmation.
+
+After you confirm, Playlist Fixer clears the current unsaved Repair results and `✓` manual changes, then analyzes the playlist again using the currently checked Music Roots. Previously saved output files on disk are not deleted.
+
 Repair does not overwrite the original playlist and does not create permanent repair progress until you save.
 
 ### View: Unresolved / Resolved
 
-- **Unresolved**: entries that have not been processed, have multiple possible matches, or have no reliable match
-- **Resolved**: entries that were kept, repaired automatically, or assigned manually
+- **Unresolved**: entries that have not been repaired, have uncertain candidates, have no reliable match, or were manually changed but not yet saved
+- **Resolved**: entries that were kept, repaired automatically, or have a saved manual selection
 
-Resolved is also an audit view. If an automatic match is wrong, you can still replace it manually.
+Unresolved shows Ambiguous and Failed entries in one table:
+
+- `△`: Ambiguous — possible candidates were found, but manual confirmation is required
+- `✕`: Failed — no reliable candidate was found; use Browse to select the file manually
+- `✓`: manually fixed, but not yet saved
+
+Ambiguous entries are shown before Failed entries by default. After Apply, the entry stays in the same position and changes to `✓`; it moves to Resolved only after Save.
+
+Resolved is also an audit view. If an automatic match is wrong, you can still replace it manually. A manual change made in Resolved temporarily shows `✓` until it is saved.
 
 ### Candidates
 
@@ -225,9 +253,11 @@ For example:
 ☐ D:\DAP Music
 ```
 
-Repair searches only `C:\PC Music`.
+Repair searches and uses files only from `C:\PC Music`.
 
-`D:\DAP Music` remains indexed, but it is excluded from the current Repair search.
+`D:\DAP Music` remains indexed, but it is excluded from the current Repair search. Even if a `D:\DAP Music` path in the original playlist still exists, Repair does not keep it while that Music Root is unchecked.
+
+If a checked Music Root is marked `[Index missing]` or `[Unavailable]`, Repair warns you before continuing.
 
 This helps prevent:
 
@@ -283,6 +313,8 @@ A Roon XLSX may contain:
 - Path
 
 Even if the XLSX came from another computer with different drive letters and folder structures, Playlist Fixer attempts to match it using metadata and the current music index.
+
+After a Roon XLSX is repaired, it is exported as a standard M3U. Playlist Fixer uses reliable Track Artist, Album Artist, and Title fields from the XLSX to create `#EXTINF` lines, so the repaired playlist does not lose normal M3U track information and become a path-only playlist. If duration is unavailable, `-1` is used; standard players can still read the playlist.
 
 ### Roon M3U
 
@@ -421,6 +453,8 @@ After Repair:
 
 If you leave the playlist without saving and import the original playlist again, it is treated as not permanently repaired.
 
+If you run Repair again and confirm the rescan, the current view switches to a new temporary Repair state. Old saved progress is not mixed into the new Unresolved or Resolved display. The new results become the current saved progress only after Save.
+
 ### Save Creates Permanent Progress
 
 After you click `Save Fixed Playlist`:
@@ -502,6 +536,14 @@ The repaired playlist output.
 
 Because it has not been indexed yet. Click `Scan New Folders`. It becomes a regular Music Root only after a successful scan.
 
+### Why does a Music Root show Index missing?
+
+The path still exists, but the related index data is missing or has not been created. Scan or rescan that Music Root.
+
+### Why does a Music Root show Unavailable?
+
+The folder or external drive is not currently accessible. Reconnect the drive or restore the folder.
+
 ### Does Scan New Folders rescan my entire library?
 
 No. It scans only newly added folders that are still Pending.
@@ -512,7 +554,19 @@ Use it when the contents, filenames, tags, or track count of an existing folder 
 
 ### Does clearing a Music Root checkbox delete it?
 
-No. It only excludes that Music Root from the current Repair search.
+No. It only excludes that Music Root from the current Repair scope, including whether original paths inside that root may be kept.
+
+### Why does an existing original path get replaced?
+
+The original path is outside the currently checked Music Roots. Repair uses only files inside the checked scope.
+
+### Why do Music Roots remain when an external drive is disconnected?
+
+Music Roots are stored separately for the current Windows user and computer. Temporarily disconnecting a drive does not delete the setting. Use `Remove Selected` or `Clear All` to remove it.
+
+### Why are Music Roots different on another computer?
+
+Each computer stores its own Music Roots. Index files carried inside the program folder do not add paths to another computer's Music Roots list.
 
 ### Why are all entries shown in Unresolved immediately after import?
 
@@ -535,6 +589,14 @@ Possible reasons include:
 Yes. Playlist Fixer uses Roon metadata and does not rely only on the original absolute path.
 
 However, manual review may still be needed when tags are missing, many versions exist, or the local files differ significantly.
+
+### Why does Apply not move an entry to Resolved immediately?
+
+Apply creates a temporary manual change. The entry remains in place with `✓` and moves to Resolved only after Save.
+
+### Why does clicking Repair (Safe) again show a confirmation?
+
+Running Repair again clears the current unsaved automatic results and `✓` manual changes, then analyzes the playlist again with the currently checked Music Roots. Previously saved output files are not deleted.
 
 ### Why does a playlist appear unrepaired after I already ran Repair?
 

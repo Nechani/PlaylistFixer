@@ -377,12 +377,41 @@ def repair_playlist(
     format_mode: str = "none",                     # "none" | "strict" | "fallback"
     format_priority_list: Optional[List[str]] = None, # e.g. [".flac",".alac",".m4a",".mp3"]
     strict_ext: Optional[str] = None,                # e.g. ".flac"
+    allowed_roots: Optional[List[str]] = None,       # existing paths are kept only inside these roots
 ):
     """Repair a playlist using a pre-built music index (import-safe)."""
     with open(index_path, "r", encoding="utf-8") as f:
         music_index = json.load(f)
 
     by_dur, by_title = build_indexes(music_index)
+
+    def path_is_in_allowed_roots(path_value: str) -> bool:
+        """Return True when path_value belongs to the active repair scope.
+
+        When no explicit roots are supplied, retain the legacy behavior and
+        allow any existing path. Windows paths are compared case-insensitively.
+        """
+        if not allowed_roots:
+            return True
+
+        import ntpath
+
+        try:
+            candidate = ntpath.normcase(ntpath.abspath(ntpath.normpath(path_value)))
+        except Exception:
+            return False
+
+        for root_value in allowed_roots:
+            try:
+                root = ntpath.normcase(ntpath.abspath(ntpath.normpath(str(root_value))))
+                if ntpath.commonpath([candidate, root]) == root:
+                    return True
+            except (ValueError, OSError, TypeError):
+                continue
+        return False
+
+    def should_keep_existing_path(path_value: str) -> bool:
+        return os.path.exists(path_value) and path_is_in_allowed_roots(path_value)
 
     def find_matches_extinf(title_n: Optional[str], artist_n: Optional[str], dur: int) -> List[dict]:
         """
@@ -551,7 +580,7 @@ def repair_playlist(
                 dur, disp = parse_extinf(line)
                 original_path = lines[i + 1].rstrip("\n")
 
-                if os.path.exists(original_path):
+                if should_keep_existing_path(original_path):
                     out_lines.append(original_path)
                     kept += 1
                     add_report(row_index, "KEPT", line, str(dur) if dur is not None else "", disp or "",
@@ -646,7 +675,7 @@ def repair_playlist(
             total += 1
             original_path = line
 
-            if os.path.exists(original_path):
+            if should_keep_existing_path(original_path):
                 out_lines.append(original_path)
                 kept += 1
                 add_report(row_index, "KEPT_PATH", "", "", "",
