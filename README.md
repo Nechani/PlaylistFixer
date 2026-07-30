@@ -22,7 +22,7 @@ Playlist Fixer can help when:
 - Playlists are moved between PC, Mac, and DAP devices
 - A DAP loads only part of a playlist
 - Roon exports point to paths from another computer
-- Roon forces you to export audio files together with an M3U, but you only want the playlist
+- Roon forces you to export audio files together with an M3U, but you only want the playlist✨
 - A playlist contains broken, outdated, relative, or device-specific paths
 
 ---
