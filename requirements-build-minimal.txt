@@ -1,0 +1,8 @@
+# Runtime dependencies
+PySide6_Essentials==6.10.1
+mutagen==1.47.0
+openpyxl==3.1.5
+
+# Build dependencies
+pyinstaller==6.18.0
+pyinstaller-hooks-contrib==2026.0

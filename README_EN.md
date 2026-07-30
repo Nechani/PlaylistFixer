@@ -87,7 +87,7 @@ DSD:
 
 ### Music Roots
 
-Music Roots is the list of music folders already indexed by Playlist Fixer.
+Music Roots contains physical index roots and optional child folders used only to narrow the Repair scope.
 
 Each path has a checkbox.
 
@@ -109,29 +109,32 @@ The splitter between Music Roots and the track list can be dragged to change the
 
 Adds one or more folders containing audio files.
 
-The normal Windows folder picker is used. After selecting one folder, you may continue adding more. Existing paths are not added twice.
+Use the folder picker to select one or more folders. Existing paths are not added twice. If an indexed parent such as `E:\Music` already contains a selected child such as `E:\Music\FLAC`, the child becomes `[Ready]` immediately and can be checked independently for Repair. The existing index is reused in the background, so the same files are not scanned twice.
 
 A Music Root may show one of these states:
 
-- `[Pending scan]`: newly added and not indexed yet
-- `[Index missing]`: the path exists, but index data is missing or has not been created
-- `[Unavailable]`: the folder or external drive is currently unavailable
+- `[Ready]`: the folder exists and can be used for Repair
+- `[Needs scan]`: the folder exists but is not indexed yet
+- `[Index missing]`: the path exists, but previously expected index data is missing
+- `[Folder missing]`: the folder or external drive is currently unavailable
 
 A newly added folder that has not yet been scanned is marked:
 
 ```text
-[Pending scan]
+[Needs scan]
 ```
 
 ### Scan New Folders
 
-Scans only newly added folders that are still marked `[Pending scan]`.
+Scans only newly added folders that are still marked `[Needs scan]`. When a child folder can reuse an indexed parent, it is already `[Ready]` and is not scanned a second time.
 
 Existing indexed folders are skipped, so adding a small folder does not require rescanning a large library.
 
+If the existing music index is damaged or has an invalid structure, Scan stops and leaves that file unchanged. Follow the error message to move or delete the damaged index before scanning again.
+
 ### Rescan Selected
 
-Rescans the currently highlighted existing Music Root.
+Rescans the currently highlighted existing Music Root. Highlighting a child such as `E:\Music\FLAC` updates only that child folder. Highlighting its parent `E:\Music` also refreshes all folders below it. Duplicate index records are not created.
 
 Use this when:
 
@@ -144,7 +147,7 @@ Other Music Roots are not affected.
 
 ### Remove Selected
 
-Removes the selected path from Music Roots and from the index.
+Removes the selected path. Removing a child that reuses its parent's index changes only the available Repair selection. If a parent is removed while one or more child paths remain in Music Roots, their existing indexed tracks are handed to the shallowest remaining children, which stay `[Ready]` without a rescan. Only tracks outside every remaining child path are removed from the index. A child becomes `[Needs scan]` only when no usable index data exists to retain.
 
 Clearing the checkbox does not remove a Music Root. Only Remove Selected does.
 
@@ -201,6 +204,8 @@ Until Save is used, applied choices remain temporary for the current session.
 
 Creates the repaired playlist and saves the current progress.
 
+When saving, you can choose M3U8 (UTF-8, recommended) or M3U (UTF-8 with BOM, legacy compatibility).
+
 ---
 
 ## 4. How Music Roots Work
@@ -209,11 +214,11 @@ Creates the repaired playlist and saves the current progress.
 
 1. Click `Add Music Folders`
 2. Select a folder containing audio files
-3. The new path is shown as `[Pending scan]`
+3. The new path is shown as `[Needs scan]`
 4. Click `Scan New Folders`
 5. After a successful scan, the path becomes a regular Music Root
 
-The path remains in the Music Roots list even if it is temporarily unavailable, cannot currently be read, or contains no indexed audio files. It is marked `[Unavailable]`, `[Index missing]`, or `[Pending scan]` as appropriate. Use `Remove Selected` or `Clear All` to remove it.
+The path remains in the Music Roots list even if it is temporarily unavailable, cannot currently be read, or contains no indexed audio files. It is marked `[Folder missing]`, `[Index missing]`, or `[Needs scan]` as appropriate. Use `Remove Selected` or `Clear All` to remove it.
 
 ### 4.2 Adding Another Music Folder Later
 
@@ -261,7 +266,7 @@ Repair searches and uses files only from `C:\PC Music`.
 
 `D:\DAP Music` remains indexed, but it is excluded from the current Repair search. Even if a `D:\DAP Music` path in the original playlist still exists, Repair does not keep it while that Music Root is unchecked.
 
-If a checked Music Root is marked `[Index missing]` or `[Unavailable]`, Repair warns you before continuing.
+If a checked Music Root is marked `[Index missing]` or `[Folder missing]`, Repair warns you before continuing.
 
 This helps prevent:
 
@@ -318,7 +323,7 @@ A Roon XLSX may contain:
 
 Even if the XLSX came from another computer with different drive letters and folder structures, Playlist Fixer attempts to match it using metadata and the current music index.
 
-After a Roon XLSX is repaired, it is exported as a standard M3U. Playlist Fixer uses reliable Track Artist, Album Artist, and Title fields from the XLSX to create `#EXTINF` lines, so the repaired playlist does not lose normal M3U track information and become a path-only playlist. If duration is unavailable, `-1` is used; standard players can still read the playlist.
+After a Roon XLSX is repaired, it can be saved as either M3U8 or M3U. Playlist Fixer uses reliable Track Artist, Album Artist, and Title fields from the XLSX to create `#EXTINF` lines, so the repaired playlist does not lose normal playlist track information and become a path-only playlist. If duration is unavailable, `-1` is used; standard players can still read the playlist.
 
 ### Roon M3U
 
@@ -346,6 +351,8 @@ After you click `Repair (Safe)`, Playlist Fixer attempts the following:
 6. Compare Roon XLSX metadata with local audio tags
 7. Compare Roon M3U path structure with the current index
 8. Calculate a combined confidence score from multiple signals
+
+If an entry is still unresolved and the original audio file is accessible, Playlist Fixer may use its embedded tags and duration as a final verifier. It resolves the entry only when those details identify exactly one candidate; missing, conflicting, or tied results remain unresolved.
 
 To avoid incorrect repairs, Playlist Fixer does not automatically choose a file based only on a matching title.
 
@@ -491,27 +498,30 @@ For example:
 
 ```text
 1.m3u
-fixed_1_selected.m3u
+fixed_1.m3u8
 ```
 
 These do not share the same repair state just because their names are similar.
 
 - Opening the original `1.m3u`: treated as the original unrepaired playlist
-- Opening the saved `fixed_1_selected.m3u`: loads the saved repair progress
+- Opening the saved `fixed_1.m3u8`: loads the saved repair progress
 
 ---
 
 ## 12. Saving the Repaired Playlist
 
-Click `Save Fixed Playlist` to create:
+Click `Save Fixed Playlist`, then choose an output format:
 
 ```text
-fixed_*_selected.m3u
+M3U8 (UTF-8, recommended)                  → fixed_<original name>.m3u8
+M3U (UTF-8 with BOM, legacy compatibility) → fixed_<original name>.m3u
 ```
 
 The original playlist is not overwritten.
 
-A repaired Roon XLSX is also exported as M3U.
+A repaired Roon XLSX can also be saved in either format.
+
+The same repaired playlist may be saved in both formats. Each saved output can be reopened with its repair progress.
 
 You may save before every entry is resolved. The saved repaired playlist can be opened later to continue working on the remaining entries.
 
@@ -542,7 +552,7 @@ Stores manual selections.
 
 Stores officially saved progress so long playlists can be resumed later.
 
-### fixed_*_selected.m3u
+### fixed_*.m3u / fixed_*.m3u8
 
 The repaired playlist output.
 
@@ -552,7 +562,7 @@ The repaired playlist output.
 
 ## 14. Frequently Asked Questions
 
-### Why does a newly added folder show Pending scan?
+### Why does a newly added folder show Needs scan?
 
 Because it has not been indexed yet. Click `Scan New Folders`. It becomes a regular Music Root only after a successful scan.
 
@@ -560,13 +570,13 @@ Because it has not been indexed yet. Click `Scan New Folders`. It becomes a regu
 
 The path still exists, but the related index data is missing or has not been created. Scan or rescan that Music Root.
 
-### Why does a Music Root show Unavailable?
+### Why does a Music Root show Folder missing?
 
 The folder or external drive is not currently accessible. Reconnect the drive or restore the folder.
 
 ### Does Scan New Folders rescan my entire library?
 
-No. It scans only newly added folders that are still Pending.
+No. It scans only newly added folders that still need scanning.
 
 ### When should I use Rescan Selected?
 
@@ -632,7 +642,7 @@ No.
 
 ### Does Playlist Fixer overwrite the original playlist?
 
-No. It creates a new `fixed_*_selected.m3u`.
+No. It creates a new `fixed_<original name>.m3u8` or `fixed_<original name>.m3u`.
 
 ### Is an internet connection required?
 

@@ -1,38 +1,29 @@
 from __future__ import annotations
-from dataclasses import dataclass
 from pathlib import Path
 import json
 import zipfile
 from datetime import datetime
 
-from PySide6.QtCore import QUrl, Signal
+from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QMessageBox,
-    QComboBox, QFormLayout, QLineEdit, QApplication
+    QFormLayout, QLineEdit, QApplication
 )
 
+from core.paths import logs_dir, reports_dir
+from core.version import APP_VERSION
+
 APP_NAME = "Playlist Fixer"
-APP_VERSION = "v0.1.0"
 MAINTAINER = "Ne"
 CONTACT_EMAIL = "plfixne@gmail.com"
 
-LANG_OPTIONS = [
-    ("en", "English"),
-    ("ja", "日本語"),
-    ("zh_TW", "繁體中文"),
-]
-
 class AboutDialog(QDialog):
-    languageChanged = Signal(str)
-
-    def __init__(self, app_data_dir: Path, current_lang: str):
-        super().__init__()
+    def __init__(self, app_data_dir: Path, parent=None):
+        super().__init__(parent)
         self.setWindowTitle("About / Help")
         self.setMinimumWidth(520)
         self._app_data_dir = app_data_dir
-        self._current_lang = current_lang
-        self._selected_lang = current_lang
 
         root = QVBoxLayout(self)
 
@@ -63,20 +54,18 @@ class AboutDialog(QDialog):
 
         root.addSpacing(10)
 
-        lang_row = QHBoxLayout()
-        lang_row.addWidget(QLabel("Language"))
-        self.lang_combo = QComboBox()
-        for code, label in LANG_OPTIONS:
-            self.lang_combo.addItem(label, code)
-        idx = max(0, self.lang_combo.findData(current_lang))
-        self.lang_combo.setCurrentIndex(idx)
-        self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
-        lang_row.addWidget(self.lang_combo, 1)
-        root.addLayout(lang_row)
-
-        hint = QLabel("Language takes effect after restart.")
-        hint.setStyleSheet("color: #666;")
-        root.addWidget(hint)
+        links = QHBoxLayout()
+        github_btn = QPushButton("Open GitHub")
+        github_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/Nechani"))
+        )
+        links.addWidget(github_btn)
+        kofi_btn = QPushButton("Open Ko-fi")
+        kofi_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://ko-fi.com/nechani"))
+        )
+        links.addWidget(kofi_btn)
+        root.addLayout(links)
 
         root.addSpacing(10)
 
@@ -91,19 +80,9 @@ class AboutDialog(QDialog):
         close_row.addWidget(close_btn)
         root.addLayout(close_row)
 
-    def selected_language(self) -> str:
-        return self._selected_lang
-
     def _copy_email(self):
         QApplication.clipboard().setText(CONTACT_EMAIL)
         QMessageBox.information(self, "Copied", "Email copied to clipboard.")
-
-    def _on_lang_changed(self):
-        code = self.lang_combo.currentData()
-        if isinstance(code, str):
-            self._selected_lang = code
-            if code != self._current_lang:
-                self.languageChanged.emit(code)
 
     def _export_bug_bundle(self):
         out_dir = self._app_data_dir / "bug_reports"
@@ -123,19 +102,21 @@ class AboutDialog(QDialog):
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
             z.writestr("app_info.json", json.dumps(app_info, ensure_ascii=False, indent=2))
 
-            cfg = self._app_data_dir / "run_config.json"
-            if cfg.exists():
-                z.write(cfg, "run_config.json")
+            for settings_name in ("settings.json", "run_config.json"):
+                settings_file = self._app_data_dir / settings_name
+                if settings_file.exists():
+                    z.write(settings_file, f"settings/{settings_name}")
 
-            reports_dir = self._app_data_dir / "reports"
-            rr = reports_dir / "repair_report.csv"
-            if rr.exists():
-                z.write(rr, "reports/repair_report.csv")
-
-            logs_dir = self._app_data_dir / "logs"
-            if logs_dir.exists():
-                for p in logs_dir.rglob("*"):
+            report_root = reports_dir()
+            if report_root.exists():
+                for p in report_root.rglob("*"):
                     if p.is_file():
-                        z.write(p, f"logs/{p.name}")
+                        z.write(p, f"reports/{p.relative_to(report_root).as_posix()}")
+
+            log_root = logs_dir()
+            if log_root.exists():
+                for p in log_root.rglob("*"):
+                    if p.is_file():
+                        z.write(p, f"logs/{p.relative_to(log_root).as_posix()}")
 
         QMessageBox.information(self, "Exported", f"Bug bundle exported:\n{zip_path}")

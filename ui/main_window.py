@@ -15,11 +15,20 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QTableWidget, QTableWidgetItem, QGroupBox,
     QListWidget, QListWidgetItem, QAbstractItemView,
-    QLineEdit, QDialog, QTextBrowser, QSplitter, QListView, QTreeView
+    QLineEdit, QDialog, QTextBrowser, QSplitter, QListView, QTreeView, QInputDialog,
+    QSizePolicy
 )
 
-from core.runner import TaskRunner, TaskResult
+from core.runner import (
+    TaskRunner,
+    TaskResult,
+    atomic_write_text,
+    normalized_root_path,
+    root_contains,
+)
 from core.paths import index_path, reports_dir, settings_path, stats_path
+from core.version import APP_VERSION
+from ui.about_dialog import AboutDialog
 
 
 class Worker(QObject):
@@ -53,7 +62,7 @@ class MainWindow(QMainWindow):
     def __init__(self, app_data=None):
         super().__init__()
         self.app_data = app_data
-        self.setWindowTitle("Playlist Fixer v2.1.0")
+        self.setWindowTitle(f"Playlist Fixer v{APP_VERSION}")
 
         self.runner = TaskRunner()
 
@@ -91,6 +100,10 @@ class MainWindow(QMainWindow):
         
         self._saved_keys: set[str] = set()
         self._persisted_progress_keys: set[str] = set()
+        # Imported fixed playlists may be moved together with their report,
+        # selection and progress sidecars.  Their canonical key changes because
+        # it contains the absolute path, so remember the actual recovered files.
+        self._persisted_artifacts_by_key: dict[str, dict[str, Path]] = {}
         # Playlists currently being re-repaired provisionally from a clean state.
         # Existing saved reports/selections remain on disk until Save, but must not
         # leak into the current Unresolved/Resolved views.
@@ -107,7 +120,12 @@ class MainWindow(QMainWindow):
         self.worker: Worker | None = None
 
         self._pending_save_keys: list[str] = []
+        self._pending_save_snapshots: list[dict] = []
+        self._pending_remove_paths: set[str] = set()
+        self._pending_repair_keys: set[str] = set()
         self._last_action: str | None = None
+        self._close_when_finished = False
+        self._close_without_prompt = False
 
         # view mode: "UNRESOLVED" | "RESOLVED"
         self._view_mode: str = "UNRESOLVED"
@@ -121,7 +139,8 @@ class MainWindow(QMainWindow):
         return self.reports_path / f"selections_{pl_key}.json"
 
     def _load_selections_for_key(self, pl_key: str) -> dict[str, str]:
-        p = self._selection_file_for_key(pl_key)
+        artifacts = self._persisted_artifacts_by_key.get(pl_key, {})
+        p = artifacts.get("selections", self._selection_file_for_key(pl_key))
         if not p.exists():
             return {}
         try:
@@ -134,11 +153,11 @@ class MainWindow(QMainWindow):
 
     def _save_selections_for_key(self, pl_key: str, sel: dict[str, str]) -> None:
         p = self._selection_file_for_key(pl_key)
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(sel, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            QMessageBox.warning(self, "Save failed", f"Could not save selections:\n{p}\n\n{e}")
+        atomic_write_text(
+            p,
+            json.dumps(sel, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _progress_file_for_key(self, pl_key: str) -> Path:
         return self.reports_path / f"progress_{pl_key}.json"
@@ -150,38 +169,204 @@ class MainWindow(QMainWindow):
         except Exception:
             return str(Path(path).absolute()).casefold()
 
-    def _has_saved_progress(self, pl_key: str, playlist: Path) -> bool:
-        """Return True only for the exact saved output playlist.
+    def _saved_progress_artifacts(
+        self,
+        pl_key: str,
+        playlist: Path,
+    ) -> dict[str, Path] | None:
+        """Locate a saved report bundle even after its folder was moved.
 
-        Progress files may share a canonical name with the original playlist, but
-        the marker records the exact fixed playlist path that was saved. This
-        prevents an untouched source playlist with the same base name from
-        inheriting the fixed playlist's repair state.
+        A user may save the same repair result as both M3U8 and M3U.  Version 3
+        markers retain every output path instead of replacing the previous format.
+        Earlier builds keyed sidecars by the output's absolute path, so moving the
+        fixed playlist and all of its sidecars changed the calculated key and made
+        intact progress look missing.  Prefer an exact path match, then accept a
+        same-folder sidecar whose recorded output filename matches.
         """
-        progress = self._progress_file_for_key(pl_key)
-        report = self.reports_path / f"repair_report_{pl_key}.csv"
-        if not (progress.exists() and report.exists()):
-            return False
+        playlist = Path(playlist)
+        exact_marker = self._progress_file_for_key(pl_key)
+        marker_candidates: list[Path] = [exact_marker]
         try:
-            data = json.loads(progress.read_text(encoding="utf-8"))
-            saved_path = data.get("saved_playlist") or data.get("source_playlist")
-            if not saved_path:
-                return False
-            return self._normalized_playlist_path(Path(saved_path)) == self._normalized_playlist_path(playlist)
+            marker_candidates.extend(playlist.parent.glob("progress_*.json"))
         except Exception:
+            pass
+        try:
+            marker_candidates.extend(self.reports_path.rglob("progress_*.json"))
+        except Exception:
+            pass
+
+        seen_markers: set[str] = set()
+        matches: list[tuple[int, float, dict[str, Path]]] = []
+        wanted_path = self._normalized_playlist_path(playlist)
+        wanted_parent = self._normalized_playlist_path(playlist.parent)
+        wanted_name = playlist.name.casefold()
+
+        for marker in marker_candidates:
+            marker_key = self._normalized_playlist_path(marker)
+            if marker_key in seen_markers or not marker.exists():
+                continue
+            seen_markers.add(marker_key)
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+            except Exception:
+                continue
+
+            saved_paths = data.get("saved_playlists")
+            if not isinstance(saved_paths, list):
+                saved_paths = []
+            legacy_path = data.get("saved_playlist")
+            if legacy_path:
+                saved_paths.append(legacy_path)
+            saved_paths = [str(path) for path in saved_paths if path]
+            exact_path_match = any(
+                self._normalized_playlist_path(Path(saved_path)) == wanted_path
+                for saved_path in saved_paths
+            )
+            filename_match = any(
+                Path(saved_path).name.casefold() == wanted_name
+                for saved_path in saved_paths
+            )
+            same_parent = (
+                self._normalized_playlist_path(marker.parent) == wanted_parent
+            )
+            exact_key_marker = (
+                self._normalized_playlist_path(marker)
+                == self._normalized_playlist_path(exact_marker)
+            )
+
+            # A filename match on its own is used only as a unique last resort.
+            if exact_path_match:
+                priority = 0
+            # A key match must not make an M3U marker count as progress for
+            # a different M3U8 output (or vice versa).  Markers that predate
+            # saved path metadata may still use the key-only fallback.
+            elif exact_key_marker and (not saved_paths or filename_match):
+                priority = 1
+            elif same_parent and filename_match:
+                priority = 2
+            elif filename_match:
+                priority = 3
+            else:
+                continue
+
+            stored_key = str(data.get("playlist_key") or "").strip()
+            if not stored_key:
+                stem = marker.stem
+                stored_key = stem[len("progress_"):] if stem.startswith("progress_") else ""
+            if not stored_key:
+                continue
+            report = marker.parent / f"repair_report_{stored_key}.csv"
+            if not report.exists():
+                continue
+            selections = marker.parent / f"selections_{stored_key}.json"
+            artifacts = {
+                "progress": marker,
+                "report": report,
+                "selections": selections,
+            }
+            try:
+                modified = marker.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            matches.append((priority, modified, artifacts))
+
+        if not matches:
+            return None
+        best_priority = min(priority for priority, _modified, _artifacts in matches)
+        best = [entry for entry in matches if entry[0] == best_priority]
+        # A basename-only match is unsafe when several independent saved outputs
+        # have the same filename. Same-folder and exact matches remain unambiguous.
+        if best_priority == 3 and len(best) != 1:
+            return None
+        best.sort(key=lambda entry: entry[1], reverse=True)
+        return best[0][2]
+
+    def _has_saved_progress(self, pl_key: str, playlist: Path) -> bool:
+        artifacts = self._saved_progress_artifacts(pl_key, playlist)
+        if artifacts is None:
+            self._persisted_artifacts_by_key.pop(pl_key, None)
             return False
+        self._persisted_artifacts_by_key[pl_key] = artifacts
+        return True
 
     def _write_progress_marker(self, pl_key: str, saved_playlist: Path, source_playlist: Path) -> None:
         p = self._progress_file_for_key(pl_key)
+        existing: dict = {}
+        if p.exists():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}
+
+        saved_paths = existing.get("saved_playlists")
+        if not isinstance(saved_paths, list):
+            saved_paths = []
+        legacy_path = existing.get("saved_playlist")
+        if legacy_path:
+            saved_paths.append(legacy_path)
+        saved_paths.append(str(saved_playlist))
+
+        unique_saved_paths: list[str] = []
+        seen: set[str] = set()
+        for saved_path in saved_paths:
+            if not saved_path:
+                continue
+            normalized = self._normalized_playlist_path(Path(saved_path))
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_saved_paths.append(str(saved_path))
+
         data = {
-            "version": 2,
+            "version": 3,
             "playlist_key": pl_key,
+            # Keep the latest value for backward compatibility with 2.2.0.
             "saved_playlist": str(saved_playlist),
-            "source_playlist": str(source_playlist),
+            "saved_playlists": unique_saved_paths,
+            # Never replace the true original with a previously exported file.
+            "source_playlist": existing.get("source_playlist") or str(source_playlist),
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
         }
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(
+            p,
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _commit_saved_snapshot(self, snapshot: dict) -> str:
+        """Persist an independent report and selection snapshot for one output."""
+        saved_output = Path(snapshot["saved_output"])
+        output_key = self.runner.canonical_key(saved_output)
+        source_report = Path(snapshot["report_csv"])
+        output_report = self.runner.report_path_for(self.reports_path, saved_output)
+        if (
+            source_report.exists()
+            and self._normalized_playlist_path(source_report)
+            != self._normalized_playlist_path(output_report)
+        ):
+            output_report.parent.mkdir(parents=True, exist_ok=True)
+            tmp_report = output_report.with_name(
+                f".{output_report.name}.{os.getpid()}.tmp"
+            )
+            try:
+                shutil.copy2(source_report, tmp_report)
+                os.replace(tmp_report, output_report)
+            finally:
+                try:
+                    if tmp_report.exists():
+                        tmp_report.unlink()
+                except OSError:
+                    pass
+        self._save_selections_for_key(output_key, snapshot.get("selections", {}) or {})
+        self._write_progress_marker(
+            output_key,
+            saved_output,
+            Path(snapshot["original_source"]),
+        )
+        return output_key
 
     def _session_report_for(self, playlist: Path) -> Path:
         return self.runner.session_report_path_for(self.reports_path, playlist)
@@ -200,8 +385,11 @@ class MainWindow(QMainWindow):
         legacy = settings_path()
         if not p.exists() and legacy.exists() and legacy != p:
             try:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+                atomic_write_text(
+                    p,
+                    legacy.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
             except Exception:
                 pass
 
@@ -216,8 +404,11 @@ class MainWindow(QMainWindow):
     def _save_settings(self, data: dict) -> None:
         p = self._settings_file()
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_text(
+                p,
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         except Exception as e:
             QMessageBox.warning(self, "Settings not saved", f"Could not save settings to:\n{p}\n\n{e}")
 
@@ -247,8 +438,13 @@ class MainWindow(QMainWindow):
                     path = str(entry["path"])
                     enabled = bool(entry.get("enabled", True))
                     saved_imported = bool(entry.get("imported", False))
+                    scope_only = bool(entry.get("scope_only", False))
+                    covered_by = str(entry.get("covered_by", "") or "")
                 else:
                     continue
+                if isinstance(entry, str):
+                    scope_only = False
+                    covered_by = ""
 
                 key = norm(path)
                 if not key or key in seen:
@@ -264,6 +460,8 @@ class MainWindow(QMainWindow):
                     # A saved imported root without a matching stats entry means
                     # the index metadata was deleted, damaged, or replaced.
                     "index_missing": imported and key not in indexed_by_key,
+                    "scope_only": scope_only,
+                    "covered_by": covered_by,
                 })
 
         # Music Roots are computer-specific settings stored in AppData.
@@ -272,6 +470,150 @@ class MainWindow(QMainWindow):
         # Roots found only in music_index.stats.json are intentionally ignored.
 
         self.music_roots = roots
+        self._reconcile_scope_roots(indexed)
+
+    def _nearest_covering_root_entry(
+        self,
+        path: object,
+        entries: list[dict] | None = None,
+    ) -> dict | None:
+        """Return the closest non-scope Music Root that contains *path*."""
+        candidates = []
+        for entry in entries if entries is not None else self.music_roots:
+            entry_path = entry.get("path")
+            if (
+                entry_path
+                and not entry.get("scope_only", False)
+                and root_contains(entry_path, path, include_same=False)
+            ):
+                candidates.append(entry)
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda entry: len(normalized_root_path(entry.get("path", ""))),
+        )
+
+    def _new_music_root_entry(self, path: Path) -> dict:
+        """Create an index root or a scope that reuses an existing parent index."""
+        covering = self._nearest_covering_root_entry(path)
+        if covering is not None:
+            usable = bool(
+                covering.get("imported", False)
+                and not covering.get("index_missing", False)
+            )
+            return {
+                "path": str(path),
+                "enabled": True,
+                "imported": usable,
+                "index_missing": not usable,
+                "scope_only": True,
+                "covered_by": str(covering.get("path", "")),
+            }
+        return {
+            "path": str(path),
+            "enabled": True,
+            "imported": False,
+            "index_missing": False,
+            "scope_only": False,
+            "covered_by": "",
+        }
+
+    def _reconcile_scope_roots(self, indexed_paths: set[str] | None = None) -> None:
+        """Keep scope aliases attached to one real index owner.
+
+        A child of an indexed root reuses that root's records. If its covering
+        root disappears, the shallowest orphan becomes a Pending index root and
+        deeper aliases attach to it.
+        """
+        indexed_values = indexed_paths if indexed_paths is not None else self._indexed_root_paths()
+        indexed_keys = {
+            normalized_root_path(path)
+            for path in indexed_values
+            if normalized_root_path(path)
+        }
+        ordered = sorted(
+            self.music_roots,
+            key=lambda entry: len(normalized_root_path(entry.get("path", ""))),
+        )
+        actual_entries: list[dict] = []
+        scope_entries: list[dict] = []
+
+        for entry in ordered:
+            entry.setdefault("scope_only", False)
+            entry.setdefault("covered_by", "")
+            key = normalized_root_path(entry.get("path", ""))
+            if not key:
+                continue
+            if entry.get("scope_only", False):
+                scope_entries.append(entry)
+                continue
+
+            is_indexed = key in indexed_keys
+            indexed_cover = self._nearest_covering_root_entry(
+                entry.get("path", ""),
+                [
+                    candidate
+                    for candidate in actual_entries
+                    if candidate.get("imported", False)
+                    and not candidate.get("index_missing", False)
+                ],
+            )
+            pending_cover = self._nearest_covering_root_entry(
+                entry.get("path", ""),
+                actual_entries,
+            )
+
+            if is_indexed:
+                entry["imported"] = True
+                entry["index_missing"] = False
+                entry["scope_only"] = False
+                entry["covered_by"] = ""
+                actual_entries.append(entry)
+            elif indexed_cover is not None:
+                entry["scope_only"] = True
+                entry["covered_by"] = str(indexed_cover.get("path", ""))
+                entry["imported"] = True
+                entry["index_missing"] = False
+                scope_entries.append(entry)
+            elif not entry.get("imported", False) and pending_cover is not None:
+                entry["scope_only"] = True
+                entry["covered_by"] = str(pending_cover.get("path", ""))
+                entry["imported"] = False
+                entry["index_missing"] = True
+                scope_entries.append(entry)
+            else:
+                entry["scope_only"] = False
+                entry["covered_by"] = ""
+                entry["index_missing"] = bool(entry.get("imported", False))
+                actual_entries.append(entry)
+
+        for entry in sorted(
+            scope_entries,
+            key=lambda candidate: len(
+                normalized_root_path(candidate.get("path", ""))
+            ),
+        ):
+            covering = self._nearest_covering_root_entry(
+                entry.get("path", ""),
+                actual_entries,
+            )
+            if covering is None:
+                key = normalized_root_path(entry.get("path", ""))
+                entry["scope_only"] = False
+                entry["covered_by"] = ""
+                entry["imported"] = key in indexed_keys
+                entry["index_missing"] = False
+                actual_entries.append(entry)
+                continue
+            usable = bool(
+                covering.get("imported", False)
+                and not covering.get("index_missing", False)
+            )
+            entry["scope_only"] = True
+            entry["covered_by"] = str(covering.get("path", ""))
+            entry["imported"] = usable
+            entry["index_missing"] = not usable
 
     def _indexed_root_paths(self) -> set[str]:
         p = stats_path()
@@ -285,23 +627,9 @@ class MainWindow(QMainWindow):
             return set()
 
     def _prune_saved_roots_against_index(self) -> None:
-        """Remove stale roots that were persisted but never made it into an index.
-
-        Music Roots represent folders actually imported into the music database,
-        not merely folders that were once selected in a file dialog.
-        """
-        indexed = self._indexed_root_paths()
-        before = len(self.music_roots)
-        if indexed:
-            self.music_roots = [
-                r for r in self.music_roots
-                if str(Path(r.get("path", ""))) in indexed
-            ]
-        else:
-            # No usable index means there are no confirmed imported roots yet.
-            self.music_roots = []
-        if len(self.music_roots) != before:
-            self._save_music_roots()
+        """Reconcile saved roots without deleting valid scope aliases."""
+        self._reconcile_scope_roots(self._indexed_root_paths())
+        self._save_music_roots()
 
     def _save_music_roots(self) -> None:
         settings = self._load_settings()
@@ -312,6 +640,8 @@ class MainWindow(QMainWindow):
                 "path": r["path"],
                 "enabled": bool(r.get("enabled", True)),
                 "imported": bool(r.get("imported", False)),
+                "scope_only": bool(r.get("scope_only", False)),
+                "covered_by": str(r.get("covered_by", "") or ""),
             }
             for r in self.music_roots if r.get("path")
         ]
@@ -319,6 +649,87 @@ class MainWindow(QMainWindow):
 
     def _enabled_music_roots(self) -> list[Path]:
         return [Path(r["path"]) for r in self.music_roots if r.get("enabled", True)]
+
+    def _pending_index_roots(self) -> list[Path]:
+        """Return only real index owners that still require a scan."""
+        return [
+            Path(entry["path"])
+            for entry in self.music_roots
+            if (
+                not entry.get("scope_only", False)
+                and (
+                    not entry.get("imported", False)
+                    or entry.get("index_missing", False)
+                )
+            )
+        ]
+
+    def _collapse_overlapping_scan_roots(self, roots: list[Path]) -> list[Path]:
+        """Keep shallowest roots so one scan never rereads a selected child."""
+        unique: dict[str, Path] = {}
+        for root in roots:
+            key = normalized_root_path(root)
+            if key:
+                unique.setdefault(key, Path(root))
+        collapsed: list[Path] = []
+        for root in sorted(
+            unique.values(),
+            key=lambda value: len(normalized_root_path(value)),
+        ):
+            if any(root_contains(parent, root) for parent in collapsed):
+                continue
+            collapsed.append(root)
+        return collapsed
+
+    def _rescan_plan_for_paths(
+        self,
+        selected_paths: set[str],
+    ) -> tuple[list[Path], dict[str, str]]:
+        """Return scan targets plus the index owner for each target."""
+        entries_by_key = {
+            normalized_root_path(entry.get("path", "")): entry
+            for entry in self.music_roots
+            if entry.get("path")
+        }
+        target_owner_pairs: list[tuple[Path, Path]] = []
+        for selected_path in selected_paths:
+            entry = entries_by_key.get(normalized_root_path(selected_path))
+            if entry is None:
+                continue
+            if entry.get("scope_only", False):
+                covering = entries_by_key.get(
+                    normalized_root_path(entry.get("covered_by", ""))
+                )
+                if covering is None:
+                    covering = self._nearest_covering_root_entry(
+                        entry.get("path", "")
+                    )
+                if covering is not None and covering.get("imported", False):
+                    target_owner_pairs.append(
+                        (
+                            Path(str(entry.get("path", ""))),
+                            Path(str(covering.get("path", ""))),
+                        )
+                    )
+            elif entry.get("imported", False):
+                path = Path(str(entry.get("path", "")))
+                target_owner_pairs.append((path, path))
+
+        targets = self._collapse_overlapping_scan_roots(
+            [target for target, _owner in target_owner_pairs]
+        )
+        target_keys = {normalized_root_path(target) for target in targets}
+        owners = {
+            str(target): str(owner)
+            for target, owner in target_owner_pairs
+            if normalized_root_path(target) in target_keys
+        }
+        return targets, owners
+
+    def _rescan_roots_for_paths(self, selected_paths: set[str]) -> list[Path]:
+        """Compatibility helper used by tests and simple callers."""
+        roots, _owners = self._rescan_plan_for_paths(selected_paths)
+        return roots
 
     def on_music_root_item_changed(self, item: QListWidgetItem) -> None:
         raw = item.data(Qt.UserRole)
@@ -333,10 +744,9 @@ class MainWindow(QMainWindow):
 
     def _update_music_roots_label(self) -> None:
         enabled = sum(1 for r in self.music_roots if r.get("enabled", True))
-        imported = sum(1 for r in self.music_roots if r.get("imported", False))
-        pending = len(self.music_roots) - imported
-        suffix = f" / Pending: {pending}" if pending else ""
-        self.lbl_music_roots.setText(f"Enabled: {enabled} / Imported: {imported}{suffix}")
+        self.lbl_music_roots.setText(
+            f"Enabled: {enabled} / Total: {len(self.music_roots)}"
+        )
 
     # ---------- tiny helpers ----------
     def _is_exported_playlist(self, pl: Path) -> bool:
@@ -349,6 +759,12 @@ class MainWindow(QMainWindow):
         )
 
     def _show_import_hint_once(self) -> None:
+        # Saved progress means this playlist is already fully or partially
+        # repaired and can go straight to manual review. The onboarding hint is
+        # useful only when every imported playlist is genuinely new.
+        if not self.playlists or self._persisted_progress_keys:
+            return
+
         settings = self._load_settings()
         if settings.get("hide_import_hint", False):
             return
@@ -358,7 +774,10 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Information)
         box.setWindowTitle("Imported")
-        box.setText("Playlists imported. Songs are listed as Not repaired until you run Repair (Safe).")
+        box.setText(
+            "These playlists do not have saved repair history yet. "
+            "Run Repair (Safe) before manual review."
+        )
         box.setCheckBox(chk)
         box.exec()
 
@@ -371,6 +790,12 @@ class MainWindow(QMainWindow):
             return (str(v) if v is not None else "").strip()
         except Exception:
             return ""
+
+    def _set_target_text(self, text: str) -> None:
+        self.lbl_target.setText(text)
+        # The label is deliberately allowed to clip instead of widening the
+        # window.  Keep the complete value available on hover.
+        self.lbl_target.setToolTip("" if text == "Target: (none)" else text)
 
     # ---------- UI helpers ----------
     def _set_busy(self, busy: bool, message: str | None = None):
@@ -398,8 +823,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # The root checkboxes define the candidate scope used by Repair. Freeze
+        # the whole list while any worker is running so the scope cannot mutate
+        # halfway through a repair or scan.
+        if getattr(self, "lst_music_roots", None) is not None:
+            self.lst_music_roots.setEnabled(not busy)
+
         if getattr(self, "btn_open_reports", None) is not None:
             self.btn_open_reports.setEnabled(True)
+
+        if getattr(self, "btn_cancel", None) is not None:
+            self.btn_cancel.setEnabled(busy)
 
         if message is not None and getattr(self, "status_label", None) is not None:
             self.status_label.setText(message)
@@ -408,6 +842,10 @@ class MainWindow(QMainWindow):
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # Pressing a row and brushing the top/bottom edge must not start the
+        # QAbstractItemView drag-selection timer, which otherwise keeps
+        # scrolling until it reaches the first/last row.
+        table.setAutoScroll(False)
 
     def _build_ui(self):
         central = QWidget()
@@ -457,6 +895,10 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.btn_open_reports)
 
         self.status_label = QLabel("Idle")
+        # Status messages may contain a full folder path.  Do not let an
+        # unbroken path become the minimum width of the whole main window.
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.scan_count_label = QLabel("Indexed: -")
         self.scan_count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -466,6 +908,13 @@ class MainWindow(QMainWindow):
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setToolTip("Stop the current scan, repair, save, or folder removal safely.")
+
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress, 1)
+        progress_row.addWidget(self.btn_cancel, 0)
 
         search_row = QHBoxLayout()
         self.edt_search = QLineEdit()
@@ -477,6 +926,12 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.lbl_target = QLabel("Target: (none)")
+        # The selected target includes its full path and EXTINF text.  QLabel's
+        # default minimum-size hint uses that entire string, which can force a
+        # vertical splitter (and then the native window) wider than the screen.
+        # Keep the complete text, but allow the layout to clip it horizontally.
+        self.lbl_target.setMinimumWidth(0)
+        self.lbl_target.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.cmb_view = QComboBox()
         self.cmb_view.addItems(["Unresolved", "Resolved"])
@@ -529,7 +984,7 @@ class MainWindow(QMainWindow):
         lower_layout.addLayout(row_scan)
         lower_layout.addLayout(row2)
         lower_layout.addLayout(status_row)
-        lower_layout.addWidget(self.progress)
+        lower_layout.addLayout(progress_row)
         lower_layout.addLayout(search_row)
         lower_layout.addLayout(controls)
         lower_layout.addWidget(inner_splitter, 1)
@@ -544,8 +999,12 @@ class MainWindow(QMainWindow):
         outer_splitter.setStretchFactor(1, 9)
         outer_splitter.setChildrenCollapsible(False)
         outer_splitter.setHandleWidth(8)
+        # Resize the panes continuously with the handle.  Long labels are
+        # shrinkable above, so live resizing cannot widen the native window.
+        outer_splitter.setOpaqueResize(True)
         inner_splitter.setChildrenCollapsible(False)
         inner_splitter.setHandleWidth(8)
+        inner_splitter.setOpaqueResize(True)
 
         # Both Music Roots and the repair/candidate areas can be resized by
         # dragging their splitter handles.
@@ -557,7 +1016,7 @@ class MainWindow(QMainWindow):
         # =========================
         # Info button in status bar (右下角)
         # =========================
-        self.lbl_build = QLabel("v2.1.0")
+        self.lbl_build = QLabel(f"v{APP_VERSION}")
         self.lbl_build.setToolTip("Build identifier. If this is not visible, an older copy is running.")
         self.statusBar().addPermanentWidget(self.lbl_build)
 
@@ -584,6 +1043,7 @@ class MainWindow(QMainWindow):
         self.btn_apply_choice.clicked.connect(self.on_apply_choice)
         self.btn_browse_choice.clicked.connect(self.on_browse_choice)
         self.btn_save_fixed.clicked.connect(self.on_save_fixed)
+        self.btn_cancel.clicked.connect(self.on_cancel_task)
 
         self.cmb_view.currentIndexChanged.connect(self.on_view_mode_changed)
 
@@ -600,24 +1060,31 @@ class MainWindow(QMainWindow):
             available = Path(path).exists()
             imported = bool(entry.get("imported", False))
             index_missing = bool(entry.get("index_missing", False))
+            waiting_for_scan = bool(entry.get("scope_only", False)) and not imported
             if not available:
-                suffix = "  [Unavailable]"
+                suffix = "  [Folder missing]"
+            elif waiting_for_scan:
+                suffix = "  [Needs scan]"
             elif index_missing:
                 suffix = "  [Index missing]"
             elif not imported:
-                suffix = "  [Pending scan]"
+                suffix = "  [Needs scan]"
             else:
-                suffix = ""
+                suffix = "  [Ready]"
             it = QListWidgetItem(path + suffix)
             it.setData(Qt.UserRole, path)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if entry.get("enabled", True) else Qt.Unchecked)
             if not available:
-                it.setToolTip("This Music Root is currently unavailable. Reconnect the drive or restore the folder.")
+                it.setToolTip("This folder is currently unavailable. Reconnect the drive or restore the folder.")
+            elif waiting_for_scan:
+                it.setToolTip("This folder is waiting for an index. Use Scan New Folders.")
             elif index_missing:
                 it.setToolTip("The folder exists, but its index record is missing. Scan or rescan this Music Root before Repair.")
             elif not imported:
                 it.setToolTip("This folder has not been indexed yet. Use Scan New Folders.")
+            else:
+                it.setToolTip("This folder is ready to use for Repair.")
             self.lst_music_roots.addItem(it)
         self.lst_music_roots.blockSignals(False)
         self._update_music_roots_label()
@@ -625,7 +1092,7 @@ class MainWindow(QMainWindow):
     def _read_playlist_text(self, playlist: Path) -> str:
         """Read text playlists without silently turning a wrong encoding into mojibake."""
         raw = playlist.read_bytes()
-        encodings = ("utf-8-sig", "utf-8", "utf-16", "cp950", "big5", "cp1252")
+        encodings = ("utf-8-sig", "utf-8", "utf-16", "cp932", "cp950", "big5", "cp1252")
         for encoding in encodings:
             try:
                 return raw.decode(encoding)
@@ -716,6 +1183,7 @@ class MainWindow(QMainWindow):
         """
         self._report_rows_by_key = {}
         self._persisted_progress_keys = set()
+        self._persisted_artifacts_by_key = {}
         self.reports_path.mkdir(parents=True, exist_ok=True)
 
         for playlist_order, pl in enumerate(self.playlists):
@@ -726,7 +1194,7 @@ class MainWindow(QMainWindow):
                 if candidate.exists():
                     report_csv = candidate
             elif self._has_saved_progress(pl_key, pl):
-                candidate = self.runner.report_path_for(self.reports_path, pl)
+                candidate = self._persisted_artifacts_by_key[pl_key]["report"]
                 if candidate.exists():
                     report_csv = candidate
                     self._persisted_progress_keys.add(pl_key)
@@ -751,6 +1219,21 @@ class MainWindow(QMainWindow):
                         rr["original_path"] = self._safe_str(src.get("original_path"))
                 self._report_rows_by_key[pl_key] = rows
 
+                # Saved manual choices are part of the repair result, not merely
+                # a display detail. Load them into the export snapshot no matter
+                # which view (Unresolved or Resolved) is currently open.
+                if (
+                    pl_key in self._persisted_progress_keys
+                    and pl_key not in self._provisional_reset_keys
+                ):
+                    disk_selections = self._load_selections_for_key(pl_key)
+                    if disk_selections:
+                        current = self._selections_by_key.get(pl_key, {}) or {}
+                        self._selections_by_key[pl_key] = {
+                            **disk_selections,
+                            **current,
+                        }
+
     def _build_unresolved_rows(self) -> tuple[list[dict], list[dict]]:
         amb_all: list[dict] = []
         fail_all: list[dict] = []
@@ -764,7 +1247,7 @@ class MainWindow(QMainWindow):
             report_rows = self._report_rows_by_key.get(pl_key, [])
 
             # Before Repair, always show the imported file itself when there is no usable
-            # report in this session. This also covers fixed_*_selected.m3u files imported
+            # report in this session. This also covers fixed_*_selected.m3u8 files imported
             # as a new input instead of treating them as invisible historical progress.
             if pl_key not in self._session_repaired_keys and not has_saved_progress:
                 pending_rows = self._parse_playlist_entries(pl)
@@ -892,14 +1375,17 @@ class MainWindow(QMainWindow):
 
             disk_sel = self._load_selections_for_key(pl_key) if has_committed_progress else {}
             mem_sel_all = self._selections_by_key.get(pl_key, {}) or {}
-            # Only unsaved edits that were made while already in Resolved are
-            # previewed here.  Unsaved fixes made in Unresolved must not appear
-            # in Resolved before Save.
-            mem_sel = {
-                row_id: chosen
-                for row_id, chosen in mem_sel_all.items()
-                if self._selection_origin.get((pl_key, str(row_id))) == "RESOLVED"
-            }
+            # After Save, every in-memory choice is committed and must appear in
+            # Resolved immediately, including rows fixed from Unresolved. Before
+            # Save, preview only edits made while already auditing Resolved.
+            if saved_this_session:
+                mem_sel = dict(mem_sel_all)
+            else:
+                mem_sel = {
+                    row_id: chosen
+                    for row_id, chosen in mem_sel_all.items()
+                    if self._selection_origin.get((pl_key, str(row_id))) == "RESOLVED"
+                }
             selections = {**disk_sel, **mem_sel}
 
             report_rows = self._report_rows_by_key.get(pl_key, [])
@@ -975,7 +1461,7 @@ class MainWindow(QMainWindow):
         self._active_target = None
         self._active_pl_key = None
         self._active_row_id = None
-        self.lbl_target.setText("Target: (none)")
+        self._set_target_text("Target: (none)")
 
         if self._view_mode == "RESOLVED":
             amb, fail = self._build_resolved_rows()
@@ -999,6 +1485,24 @@ class MainWindow(QMainWindow):
     def on_view_mode_changed(self, idx: int):
         self._view_mode = "RESOLVED" if idx == 1 else "UNRESOLVED"
         self._refresh_tables_from_mode()
+
+    def _has_unsaved_work(self) -> bool:
+        if self._dirty_selection_ids:
+            return True
+        return bool(self._session_repaired_keys - self._saved_keys)
+
+    def _confirm_discard_unsaved(self, action: str) -> bool:
+        if not self._has_unsaved_work():
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Unsaved repair changes",
+            "The current repair result or manual changes have not been saved.\n\n"
+            f"{action} will discard them from this session.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
 
     def on_add_music(self):
         # Qt's native Windows folder picker only supports one folder.  Use the
@@ -1042,43 +1546,76 @@ class MainWindow(QMainWindow):
             seen_folders.add(normalized)
             normalized_folders.append(str(Path(folder)))
 
-        folders = normalized_folders
+        folders = sorted(
+            normalized_folders,
+            key=lambda value: len(normalized_root_path(value)),
+        )
         if not folders:
             return
 
         existing = {
-            os.path.normcase(os.path.normpath(str(r.get("path", ""))))
+            normalized_root_path(r.get("path", ""))
             for r in self.music_roots
+            if r.get("path")
         }
         added = 0
         duplicates = 0
+        scope_added = 0
 
         for folder in folders:
             p = Path(folder)
-            key = os.path.normcase(os.path.normpath(str(p)))
+            key = normalized_root_path(p)
             if key in existing:
                 duplicates += 1
                 continue
 
-            self.music_roots.append({"path": str(p), "enabled": True, "imported": False, "index_missing": False})
+            entry = self._new_music_root_entry(p)
+            self.music_roots.append(entry)
             existing.add(key)
             added += 1
+            if entry.get("scope_only", False):
+                scope_added += 1
 
         if added:
+            # Adding a new parent above Pending child roots makes those children
+            # scope aliases immediately. Imported child roots remain independent
+            # until the new parent scan succeeds, so the working index is never
+            # discarded early.
+            self._reconcile_scope_roots(self._indexed_root_paths())
             # Save immediately so the list survives a restart even before Scan.
             self._save_music_roots()
             self._refresh_music_roots_ui()
 
-        if added and duplicates:
-            self.status_label.setText(
-                f"Pending scan: {added} folder(s); already added: {duplicates}"
+        status_parts = []
+        if added:
+            pending_added = sum(
+                1
+                for entry in self.music_roots
+                if (
+                    normalized_root_path(entry.get("path", ""))
+                    in {
+                        normalized_root_path(folder)
+                        for folder in folders
+                    }
+                    and not entry.get("scope_only", False)
+                    and not entry.get("imported", False)
+                )
             )
-        elif added:
-            self.status_label.setText(f"Pending scan: {added} folder(s)")
+            if pending_added:
+                status_parts.append(f"Needs scan: {pending_added} folder(s)")
+            if scope_added:
+                status_parts.append(f"Ready: {scope_added} folder(s)")
+        if duplicates:
+            status_parts.append(f"already added: {duplicates}")
+        if status_parts:
+            self.status_label.setText("; ".join(status_parts))
         else:
-            self.status_label.setText(f"Already added: {duplicates} folder(s)")
+            self.status_label.setText("No folder was added")
 
     def on_remove_music_roots(self):
+        if self._busy:
+            QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
+            return
         items = self.lst_music_roots.selectedItems()
         if not items:
             return
@@ -1092,18 +1629,96 @@ class MainWindow(QMainWindow):
         if not to_remove:
             return
 
-        self.music_roots = [r for r in self.music_roots if str(r.get("path", "")) not in to_remove]
-        self._save_music_roots()
-        self._refresh_music_roots_ui()
-        self.status_label.setText(f"Removed: {len(to_remove)} folder(s)")
+        selected_entries = [
+            entry
+            for entry in self.music_roots
+            if str(entry.get("path", "")) in to_remove
+        ]
+        scope_paths = {
+            str(entry.get("path", ""))
+            for entry in selected_entries
+            if entry.get("scope_only", False)
+        }
+        index_root_paths = {
+            str(entry.get("path", ""))
+            for entry in selected_entries
+            if not entry.get("scope_only", False)
+        }
+
+        if scope_paths:
+            self.music_roots = [
+                entry
+                for entry in self.music_roots
+                if str(entry.get("path", "")) not in scope_paths
+            ]
+            self._save_music_roots()
+            self._refresh_music_roots_ui()
+
+        if not index_root_paths:
+            self.status_label.setText(
+                f"Removed {len(scope_paths)} Repair scope folder(s); music index unchanged"
+            )
+            return
+
+        # A retained child already has records inside the parent's index. Hand
+        # those rows to the child when the parent is removed instead of forcing
+        # an unnecessary disk rescan.
+        preserve_paths = [
+            Path(str(entry.get("path", "")))
+            for entry in self.music_roots
+            if (
+                entry.get("path")
+                and str(entry.get("path", "")) not in to_remove
+                and any(
+                    root_contains(parent, entry.get("path", ""), include_same=False)
+                    for parent in index_root_paths
+                )
+            )
+        ]
+
+        self._pending_remove_paths = set(index_root_paths)
+        self._last_action = "REMOVE_ROOTS"
+        self._run_task(
+            self.runner.remove_roots_from_index,
+            roots_to_remove=[Path(p) for p in sorted(index_root_paths)],
+            out_index=self.index_path,
+            preserve_roots=preserve_paths,
+        )
 
     def on_clear_music_roots(self):
+        if self._busy:
+            QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
+            return
         if not self.music_roots:
             return
-        self.music_roots = []
-        self._save_music_roots()
-        self._refresh_music_roots_ui()
-        self.status_label.setText("Cleared all music folders")
+        answer = QMessageBox.question(
+            self,
+            "Clear all Music Roots?",
+            "This removes every Music Root from the list and deletes their entries "
+            "from the music index.\n\nYour actual audio files will not be deleted.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        roots_to_remove = [
+            Path(r.get("path", ""))
+            for r in self.music_roots
+            if r.get("path") and not r.get("scope_only", False)
+        ]
+        if not roots_to_remove:
+            self.music_roots = []
+            self._save_music_roots()
+            self._refresh_music_roots_ui()
+            self.status_label.setText("Cleared all Repair scope folders; music index unchanged")
+            return
+        self._pending_remove_paths = {str(path) for path in roots_to_remove}
+        self._last_action = "CLEAR_ROOTS"
+        self._run_task(
+            self.runner.remove_roots_from_index,
+            roots_to_remove=roots_to_remove,
+            out_index=self.index_path,
+        )
 
     def on_scan_index(self):
         """Import only folders that have not yet been indexed.
@@ -1116,16 +1731,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
             return
 
-        scan_roots = [
-            Path(r["path"])
-            for r in self.music_roots
-            if not r.get("imported", False) or r.get("index_missing", False)
-        ]
+        scan_roots = self._pending_index_roots()
         if not scan_roots:
             QMessageBox.information(
                 self,
                 "No new folders",
-                "There are no Pending scan folders.\n\n"
+                "There are no folders that need scanning.\n\n"
                 "Use Rescan Selected only when you intentionally want to refresh an existing folder.",
             )
             return
@@ -1136,6 +1747,7 @@ class MainWindow(QMainWindow):
             return
 
         self.status_label.setText(f"Scanning {len(scan_roots)} new folder(s)…")
+        self._last_action = "SCAN"
         self._run_task(self.runner.scan_index, music_roots=scan_roots, out_index=self.index_path)
 
     def on_rescan_selected(self):
@@ -1153,16 +1765,13 @@ class MainWindow(QMainWindow):
             for item in self.lst_music_roots.selectedItems()
             if item.data(Qt.UserRole)
         }
-        scan_roots = [
-            Path(r["path"])
-            for r in self.music_roots
-            if r.get("imported", False) and str(r.get("path", "")) in selected_paths
-        ]
+        scan_roots, root_owners = self._rescan_plan_for_paths(selected_paths)
         if not scan_roots:
             QMessageBox.information(
                 self,
                 "Select imported folder",
                 "Highlight one or more already imported folders in the list, then choose Rescan Selected.\n\n"
+                "Scope-only folders update only their part of the covering index. "
                 "The checkbox is only for Repair scope.",
             )
             return
@@ -1186,7 +1795,13 @@ class MainWindow(QMainWindow):
             return
 
         self.status_label.setText(f"Rescanning {len(scan_roots)} selected folder(s)…")
-        self._run_task(self.runner.scan_index, music_roots=scan_roots, out_index=self.index_path)
+        self._last_action = "SCAN"
+        self._run_task(
+            self.runner.scan_index,
+            music_roots=scan_roots,
+            out_index=self.index_path,
+            root_owners=root_owners,
+        )
 
     def on_import_playlists(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -1197,12 +1812,12 @@ class MainWindow(QMainWindow):
         )
         if not files:
             return
+        if not self._confirm_discard_unsaved("Importing another playlist"):
+            return
 
         self.playlists = [Path(p) for p in files]
         self.status_label.setText(f"Loaded playlists: {len(self.playlists)}")
-        
-        self._show_import_hint_once()
-       
+
         # load reports cache then refresh view
         self._selections_by_key = {}          # ✅ 清掉上一輪 Apply 的記憶體選擇
         self._dirty_selection_ids.clear()      # 新 session 尚無未儲存修改
@@ -1211,6 +1826,7 @@ class MainWindow(QMainWindow):
         self._provisional_reset_keys = set()
         self._reload_reports_cache()
         self._refresh_tables_from_mode()
+        self._show_import_hint_once()
 
     def _begin_clean_provisional_rerun(self, current_keys: set[str]) -> None:
         """Reset current-session state while preserving previously saved files on disk."""
@@ -1231,16 +1847,17 @@ class MainWindow(QMainWindow):
     def _saved_source_playlist(self, playlist: Path) -> Path | None:
         """Return the original source recorded for an imported fixed playlist."""
         pl_key = self.runner.canonical_key(playlist)
-        marker = self._progress_file_for_key(pl_key)
-        if not marker.exists():
+        artifacts = (
+            self._persisted_artifacts_by_key.get(pl_key)
+            or self._saved_progress_artifacts(pl_key, playlist)
+        )
+        if artifacts is None:
             return None
+        marker = artifacts["progress"]
         try:
             data = json.loads(marker.read_text(encoding="utf-8"))
-            saved = data.get("saved_playlist")
             source = data.get("source_playlist")
-            if not saved or not source:
-                return None
-            if self._normalized_playlist_path(Path(saved)) != self._normalized_playlist_path(playlist):
+            if not source:
                 return None
             source_path = Path(source)
             return source_path if source_path.exists() else None
@@ -1354,10 +1971,12 @@ class MainWindow(QMainWindow):
         self._active_target = None
         self._active_pl_key = None
         self._active_row_id = None
-        self.lbl_target.setText("Target: (none)")
+        self._set_target_text("Target: (none)")
         self._fill_table(self.tbl_repair, [])
         self.lst_candidates.clear()
         self._session_repaired_keys = {self.runner.canonical_key(pl) for pl in self.playlists}
+        self._pending_repair_keys = set(self._session_repaired_keys)
+        self._last_action = "REPAIR"
 
         self._run_task(
             self.runner.repair_playlists,
@@ -1452,7 +2071,7 @@ class MainWindow(QMainWindow):
     def on_save_fixed(self):
         """
         Save/export final playlists.
-        This is the ONLY step that writes fixed_*_selected.m3u
+        This is the ONLY step that writes fixed_*.m3u or .m3u8
         AND the ONLY step that persists selections_*.json
         """
         if self._busy:
@@ -1462,21 +2081,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No playlist", "Please import playlist(s) first.")
             return
 
+        format_label, accepted = QInputDialog.getItem(
+            self,
+            "Playlist format",
+            "Save as:",
+            ["M3U8 (UTF-8, recommended)", "M3U (UTF-8 with BOM, legacy compatibility)"],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        export_extension = ".m3u" if format_label.startswith("M3U (") else ".m3u8"
+
         jobs = []
         pending_keys: list[str] = []
+        pending_snapshots: list[dict] = []
 
         for pl in self.playlists:
             pl_key = self.runner.canonical_key(pl)
             if pl_key in self._session_repaired_keys:
                 report_csv = self._session_report_for(pl)
             elif self._has_saved_progress(pl_key, pl):
-                report_csv = self.runner.report_path_for(self.reports_path, pl)
+                report_csv = self._persisted_artifacts_by_key[pl_key]["report"]
             else:
                 continue
             if not report_csv.exists():
                 continue
 
-            out_m3u = self.runner.export_path_for(self.reports_path, pl)
+            out_m3u = self.runner.export_path_for(self.reports_path, pl, export_extension)
             # Take a detached snapshot so the worker receives exactly the choices
             # visible at the moment Save is pressed.  Also attach original-path
             # fallbacks: this protects manual repairs if a report row id is read
@@ -1504,66 +2136,70 @@ class MainWindow(QMainWindow):
                 "source_playlist": str(pl),
             })
             pending_keys.append(pl_key)
+            pending_snapshots.append({
+                "source_key": pl_key,
+                "source_playlist": pl,
+                "original_source": self._saved_source_playlist(pl) or pl,
+                "report_csv": report_csv,
+                "saved_output": out_m3u,
+                "selections": selections,
+            })
 
         if not jobs:
             QMessageBox.critical(self, "Missing report", "No active Repair result or saved progress was found.\nRun Repair (Safe) first.")
             return
 
+        output_counts: dict[str, int] = {}
+        output_names: dict[str, str] = {}
+        for job in jobs:
+            output_path = Path(job["out_m3u"])
+            normalized = self._normalized_playlist_path(output_path)
+            output_counts[normalized] = output_counts.get(normalized, 0) + 1
+            output_names[normalized] = output_path.name
+        duplicate_outputs = sorted(
+            output_names[path]
+            for path, count in output_counts.items()
+            if count > 1
+        )
+        if duplicate_outputs:
+            QMessageBox.critical(
+                self,
+                "Duplicate output filename",
+                "Two or more imported playlists would be saved to the same file:\n\n"
+                + "\n".join(duplicate_outputs)
+                + "\n\nRename one of the source playlists so each fixed playlist "
+                "has a different filename.",
+            )
+            return
+
+        existing_outputs = sorted({
+            Path(job["out_m3u"]).name
+            for job in jobs
+            if Path(job["out_m3u"]).exists()
+        })
+        if existing_outputs:
+            preview = "\n".join(existing_outputs[:10])
+            if len(existing_outputs) > 10:
+                preview += f"\n…and {len(existing_outputs) - 10} more"
+            answer = QMessageBox.question(
+                self,
+                "Replace existing fixed playlist?",
+                "These output files already exist:\n\n"
+                + preview
+                + "\n\nReplace them with the current repair result?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
         self._pending_save_keys = pending_keys
-        self._pending_save_sources = {self.runner.canonical_key(pl): pl for pl in self.playlists}
-        self._pending_save_outputs = {
-            self.runner.canonical_key(pl): self.runner.export_path_for(self.reports_path, pl)
-            for pl in self.playlists
-        }
+        self._pending_save_snapshots = pending_snapshots
         self._last_action = "SAVE"
         self._run_task(self.runner.export_fixed_multi, jobs=jobs)
     
     def on_about(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("About Playlist Fixer")
-        dlg.setModal(True)
-
-        layout = QVBoxLayout(dlg)
-
-        html = """
-        <h3>Playlist Fixer</h3>
-        <p>
-          Author: <b>Ne</b><br/>
-          GitHub:
-          <a href="https://github.com/Nechani">
-            https://github.com/Nechani
-          </a><br/>
-          Support (Ko-fi):
-          <a href="https://ko-fi.com/nechani">
-            https://ko-fi.com/nechani
-          </a>
-        </p>
-
-        <p>
-          If you encounter any issues or unexpected behavior,<br/>
-          feel free to contact me at
-          <a href="mailto:plfixne@gmail.com">plfixne@gmail.com</a>
-        </p>
-
-        <p style="color:#666; font-size: 11px;">
-          No paywall. No ads. Built for people who care about their libraries.
-        </p>
-        """
-
-        view = QTextBrowser()
-        view.setHtml(html)
-        view.setOpenExternalLinks(True)  # ✅ 點連結用預設瀏覽器開
-        view.setMinimumWidth(520)
-        view.setMinimumHeight(220)
-
-        layout.addWidget(view)
-
-        btn_close = QPushButton("Close")
-        btn_close.clicked.connect(dlg.close)
-        layout.addWidget(btn_close, 0, Qt.AlignRight)
-
-        dlg.resize(560, 260)
-        dlg.exec()
+        AboutDialog(Path(self.app_data), self).exec()
 
     # ---------- internals ----------
     def _rebuild_row_maps(self):
@@ -1586,18 +2222,18 @@ class MainWindow(QMainWindow):
         self.lst_candidates.clear()
 
         if self._active_target is None or self._active_row_id is None or self._active_pl_key is None:
-            self.lbl_target.setText("Target: (none)")
+            self._set_target_text("Target: (none)")
             return
 
         key = f"{self._active_pl_key}::{self._active_row_id}"
         r = self._amb_by_id.get(key) if self._active_target == "AMBIGUOUS" else self._fail_by_id.get(key)
 
         if not r:
-            self.lbl_target.setText("Target: (none)")
+            self._set_target_text("Target: (none)")
             return
 
         extinf = str(r.get("extinf_display", ""))
-        self.lbl_target.setText(
+        self._set_target_text(
             f"Target: {self._active_target} | key={self._active_pl_key} | row={self._active_row_id} | {extinf}"
         )
 
@@ -1676,8 +2312,30 @@ class MainWindow(QMainWindow):
             return ""
         return txt
 
+    def on_cancel_task(self):
+        if not self._busy or self.worker is None:
+            return
+        self.worker.cancel()
+        self.btn_cancel.setEnabled(False)
+        self.status_label.setText("Cancelling safely…")
+
+    def _clear_interrupted_action(self, action: str | None) -> None:
+        if action in ("REMOVE_ROOTS", "CLEAR_ROOTS"):
+            self._pending_remove_paths = set()
+        elif action == "SAVE":
+            self._pending_save_keys = []
+            self._pending_save_snapshots = []
+        elif action == "REPAIR":
+            interrupted = set(self._pending_repair_keys)
+            self._session_repaired_keys.difference_update(interrupted)
+            self._provisional_reset_keys.difference_update(interrupted)
+            self._pending_repair_keys = set()
+            self._reload_reports_cache()
+            self._refresh_tables_from_mode()
+        self._last_action = None
+
     def _run_task(self, func, **kwargs):
-        if self._busy:
+        if self._busy or (self.thread is not None and self.thread.isRunning()):
             QMessageBox.information(self, "Busy", "A task is already running. Please wait.")
             return
 
@@ -1697,9 +2355,21 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
+        self.worker.failed.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self._on_thread_finished)
         self.thread.finished.connect(self.thread.deleteLater)
 
         self.thread.start()
+
+    @Slot()
+    def _on_thread_finished(self):
+        self.worker = None
+        self.thread = None
+        self._set_busy(False)
+        if self._close_when_finished:
+            self._close_when_finished = False
+            self._close_without_prompt = True
+            self.close()
 
     @Slot(int, str)
     def _on_progress(self, pct: int, msg: str):
@@ -1713,22 +2383,97 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_finished(self, result):
-        self._set_busy(False)
         self.progress.setValue(100)
 
         if isinstance(result, TaskResult):
             self.status_label.setText(result.message or "Done")
             outs = result.outputs or {}
+            if not result.ok:
+                action = self._last_action
+                cancelled = bool(outs.get("cancelled")) or "cancel" in (result.message or "").casefold()
+                self._clear_interrupted_action(action)
+                self.progress.setValue(0)
+                self.status_label.setText("Cancelled" if cancelled else "Error")
+                if not cancelled and not self._close_when_finished:
+                    QMessageBox.critical(self, "Error", result.message or "The task failed.")
+                return
+
+            if getattr(self, "_last_action", None) in ("REMOVE_ROOTS", "CLEAR_ROOTS"):
+                action = self._last_action
+                pending = set(getattr(self, "_pending_remove_paths", set()) or set())
+                self._last_action = None
+                self._pending_remove_paths = set()
+                if not result.ok:
+                    title = "Clear failed" if action == "CLEAR_ROOTS" else "Remove failed"
+                    QMessageBox.critical(self, title, result.message)
+                    return
+
+                if action == "CLEAR_ROOTS":
+                    self.music_roots = []
+                else:
+                    self.music_roots = [
+                        root
+                        for root in self.music_roots
+                        if str(root.get("path", "")) not in pending
+                    ]
+                    # Scope aliases whose index owner was removed become Pending
+                    # roots; nested aliases attach to the shallowest survivor.
+                    self._reconcile_scope_roots(self._indexed_root_paths())
+                self._save_music_roots()
+                self._refresh_music_roots_ui()
+                total = int(outs.get("total_indexed", 0) or 0)
+                removed = int(outs.get("removed_indexed", 0) or 0)
+                reassigned = int(outs.get("reassigned_indexed", 0) or 0)
+                seconds = float(outs.get("remove_seconds", 0) or 0)
+                self.scan_count_label.setText(f"Indexed: {total}")
+                if action == "CLEAR_ROOTS":
+                    message = (
+                        f"Cleared all music folders and removed {removed} indexed track(s) "
+                        f"in {seconds:.2f}s"
+                    )
+                else:
+                    if reassigned:
+                        message = (
+                            f"Removed {len(pending)} folder(s); kept {reassigned} indexed "
+                            f"track(s) for remaining child folders and removed {removed}; "
+                            f"total library: {total}; completed in {seconds:.2f}s"
+                        )
+                    else:
+                        message = (
+                            f"Removed {len(pending)} folder(s) and {removed} indexed track(s); "
+                            f"total library: {total}; completed in {seconds:.2f}s"
+                        )
+                self.status_label.setText(message)
+                return
 
             # Scan result: persist only roots that actually contributed tracks.
             if "root_results" in outs:
+                self._last_action = None
                 results = outs.get("root_results", []) or []
-                scanned_paths = {str(Path(r.get("root", ""))) for r in results if r.get("root")}
+                full_results = [
+                    result_row
+                    for result_row in results
+                    if (
+                        result_row.get("root")
+                        and normalized_root_path(result_row.get("root", ""))
+                        == normalized_root_path(
+                            result_row.get("scan_path") or result_row.get("root", "")
+                        )
+                    )
+                ]
+                scanned_paths = {
+                    str(Path(r.get("root", "")))
+                    for r in full_results
+                    if r.get("root")
+                }
                 successful = {
                     str(Path(r.get("root", "")))
-                    for r in results
+                    for r in full_results
                     if r.get("root") and int(r.get("indexed", 0) or 0) > 0
                 }
+                successful_targets = sum(
+                    1 for r in results if int(r.get("indexed", 0) or 0) > 0
+                )
 
                 kept: list[dict] = []
                 for entry in self.music_roots:
@@ -1742,6 +2487,9 @@ class MainWindow(QMainWindow):
                     kept.append(entry)
 
                 self.music_roots = kept
+                # A successful parent scan takes ownership of covered child
+                # records. Keep those child paths as scope aliases, not new scans.
+                self._reconcile_scope_roots(self._indexed_root_paths())
                 self._save_music_roots()
                 self._refresh_music_roots_ui()
 
@@ -1749,21 +2497,27 @@ class MainWindow(QMainWindow):
                 scan_indexed = int(outs.get("scan_indexed", 0) or 0)
                 total_indexed = int(outs.get("total_indexed", scan_indexed) or 0)
                 preserved_indexed = int(outs.get("preserved_indexed", 0) or 0)
+                deduplicated_paths = int(outs.get("deduplicated_paths", 0) or 0)
                 self.scan_count_label.setText(f"Indexed: {total_indexed}")
                 msg = (
-                    f"Scan complete. Added/updated roots: {len(successful)}; "
+                    f"Scan complete. Added/updated folders: {successful_targets}; "
                     f"tracks scanned: {scan_indexed}; total library: {total_indexed}"
                 )
                 if preserved_indexed:
                     msg += f"; retained from other indexed roots: {preserved_indexed}"
+                if deduplicated_paths:
+                    msg += f"; duplicate paths removed: {deduplicated_paths}"
                 if rejected:
                     msg += f"; empty/unreadable roots kept as Pending: {rejected}"
                 self.status_label.setText(msg)
-                QMessageBox.information(self, "Scan Complete", msg)
+                if not self._close_when_finished:
+                    QMessageBox.information(self, "Scan Complete", msg)
                 return
 
             # Repair result
             if "ambiguous" in outs or "failed" in outs:
+                self._last_action = None
+                self._pending_repair_keys = set()
                 # After repair, reports on disk changed -> reload cache then refresh current view
                 self._reload_reports_cache()
                 self._refresh_tables_from_mode()
@@ -1778,52 +2532,62 @@ class MainWindow(QMainWindow):
                     except Exception:
                         total_amb = total_fail = total_rep = total_kept = 0
 
-                    QMessageBox.information(
-                        self,
-                        "Repair Complete",
-                        f"Kept: {total_kept}\n"
-                        f"Repaired: {total_rep}\n"
-                        f"Ambiguous: {total_amb}\n"
-                        f"Failed: {total_fail}\n\n"
-                        f"Reports: {self.reports_path}",
-                    )
+                    if not self._close_when_finished:
+                        QMessageBox.information(
+                            self,
+                            "Repair Complete",
+                            f"Kept: {total_kept}\n"
+                            f"Repaired: {total_rep}\n"
+                            f"Ambiguous: {total_amb}\n"
+                            f"Failed: {total_fail}\n\n"
+                            f"Reports: {self.reports_path}",
+                        )
                 return
 
             # Save result
             if "done" in outs:
                 if getattr(self, "_last_action", None) == "SAVE":
-                    for pl_key in getattr(self, "_pending_save_keys", []) or []:
-                        source = getattr(self, "_pending_save_sources", {}).get(pl_key)
-                        if source is not None:
-                            session_report = self._session_report_for(source)
-                            persistent_report = self.runner.report_path_for(self.reports_path, source)
-                            if session_report.exists():
-                                persistent_report.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(session_report, persistent_report)
-                            saved_output = getattr(self, "_pending_save_outputs", {}).get(pl_key)
-                            if saved_output is not None:
-                                self._write_progress_marker(pl_key, saved_output, source)
-                        sel = self._selections_by_key.get(pl_key, {}) or {}
-                        self._save_selections_for_key(pl_key, sel)
-                        self._saved_keys.add(pl_key)
-                        self._persisted_progress_keys.add(pl_key)
-                        self._provisional_reset_keys.discard(pl_key)
-                        self._dirty_selection_ids = {
-                            key for key in self._dirty_selection_ids if key[0] != pl_key
-                        }
-                        self._selection_origin = {
-                            key: origin
-                            for key, origin in self._selection_origin.items()
-                            if key[0] != pl_key
-                        }
+                    try:
+                        for snapshot in getattr(self, "_pending_save_snapshots", []) or []:
+                            pl_key = snapshot["source_key"]
+                            self._commit_saved_snapshot(snapshot)
+                            self._saved_keys.add(pl_key)
+                            self._persisted_progress_keys.add(pl_key)
+                            self._provisional_reset_keys.discard(pl_key)
+                            self._dirty_selection_ids = {
+                                key for key in self._dirty_selection_ids if key[0] != pl_key
+                            }
+                            self._selection_origin = {
+                                key: origin
+                                for key, origin in self._selection_origin.items()
+                                if key[0] != pl_key
+                            }
+                    except Exception as exc:
+                        self._pending_save_keys = []
+                        self._pending_save_snapshots = []
+                        self._last_action = None
+                        self.progress.setValue(0)
+                        self.status_label.setText("Repair history was not saved")
+                        if not self._close_when_finished:
+                            QMessageBox.critical(
+                                self,
+                                "Repair history not saved",
+                                "The fixed playlist was written, but its repair history could "
+                                f"not be saved completely.\n\n{exc}",
+                            )
+                        return
                     self._pending_save_keys = []
-                    self._pending_save_sources = {}
-                    self._pending_save_outputs = {}
+                    self._pending_save_snapshots = []
                     self._last_action = None
 
                 done = outs.get("done", [])
                 first = done[0].get("out_m3u", "") if done else ""
-                QMessageBox.information(self, "Save Complete", f"{result.message}\n\nExample output:\n{first}")
+                if not self._close_when_finished:
+                    QMessageBox.information(
+                        self,
+                        "Save Complete",
+                        f"{result.message}\n\nExample output:\n{first}",
+                    )
 
                 # After save, if user is in Unresolved view, they likely want remaining list updated.
                 # Reload reports cache + refresh tables (respects current view mode).
@@ -1831,14 +2595,52 @@ class MainWindow(QMainWindow):
                 self._refresh_tables_from_mode()
                 return
 
+        self._last_action = None
         self.status_label.setText("Done")
 
     @Slot(str)
     def _on_failed(self, err: str):
-        self._set_busy(False)
+        action = self._last_action
+        self._clear_interrupted_action(action)
         self.progress.setValue(0)
         self.status_label.setText("Error")
-        QMessageBox.critical(self, "Error", err)
+        if not self._close_when_finished:
+            QMessageBox.critical(self, "Error", err)
+
+    def closeEvent(self, event):
+        if self._close_without_prompt:
+            event.accept()
+            return
+
+        thread_running = self.thread is not None and self.thread.isRunning()
+        if thread_running:
+            detail = ""
+            if self._has_unsaved_work():
+                detail = "\n\nUnsaved repair changes will also be discarded."
+            answer = QMessageBox.question(
+                self,
+                "Cancel task and close?",
+                "A background task is still running. Cancel it safely and close "
+                "after it has stopped?"
+                + detail,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._close_when_finished = True
+            if self.worker is not None:
+                self.worker.cancel()
+            self.btn_cancel.setEnabled(False)
+            self.status_label.setText("Cancelling safely before closing…")
+            event.ignore()
+            return
+
+        if not self._confirm_discard_unsaved("Closing Playlist Fixer"):
+            event.ignore()
+            return
+        event.accept()
 
     def _fill_table(self, table: QTableWidget, rows: list[dict]):
         """Fill the repair table efficiently, including large Resolved views."""
@@ -1980,7 +2782,7 @@ class MainWindow(QMainWindow):
         self._active_target = None
         self._active_pl_key = None
         self._active_row_id = None
-        self.lbl_target.setText("Target: (none)")
+        self._set_target_text("Target: (none)")
 
     def on_search_changed(self, _text: str) -> None:
         self._apply_search_filter()

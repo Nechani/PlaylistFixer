@@ -87,7 +87,7 @@ DSD：
 
 ### Music Roots
 
-Music Roots 是 Playlist Fixer 已建立索引的音樂資料夾清單。
+Music Roots 包含實際建立索引的資料夾，以及只用來縮小 Repair 範圍的子資料夾。
 
 每個路徑前方都有核取方塊。
 
@@ -109,29 +109,32 @@ Music Roots 與下方歌曲清單之間的分隔線可以拖曳，用來調整�
 
 新增一個或多個包含音樂檔案的資料夾。
 
-每次會開啟 Windows 原生資料夾選擇視窗。選完一個資料夾後，可繼續加入其他資料夾；已存在的路徑不會重複新增。
+使用資料夾選擇視窗加入一個或多個資料夾；已存在的路徑不會重複新增。若已建立索引的父資料夾（例如 `E:\Music`）包含新加入的子資料夾（例如 `E:\Music\FLAC`），子資料夾會立刻顯示為 `[Ready]`，並可獨立勾選作為 Repair 範圍。程式會在背後沿用既有索引，不會重複掃描相同歌曲。
 
 Music Root 可能顯示以下狀態：
 
-- `[Pending scan]`：剛加入，尚未建立索引
-- `[Index missing]`：路徑仍存在，但索引資料遺失或尚未建立
-- `[Unavailable]`：資料夾或外接硬碟目前不存在
+- `[Ready]`：資料夾存在，而且可以用於 Repair
+- `[Needs scan]`：資料夾存在，但尚未建立索引
+- `[Index missing]`：路徑仍存在，但原本應有的索引資料已遺失
+- `[Folder missing]`：資料夾或外接硬碟目前無法存取
 
 剛加入、尚未掃描的資料夾會顯示：
 
 ```text
-[Pending scan]
+[Needs scan]
 ```
 
 ### Scan New Folders
 
-只掃描新加入、仍標記為 `[Pending scan]` 的資料夾。
+只掃描新加入、仍標記為 `[Needs scan]` 的資料夾。若子資料夾可以沿用已建立的父資料夾索引，它已經是 `[Ready]`，不會再次掃描。
 
 已建立索引的舊資料夾不會重新掃描，因此新增少量音樂時，不需要重新掃描整個大型音樂庫。
 
+若既有音樂索引損壞或結構不正確，Scan 會停止並保持該檔案不變。請依錯誤訊息移動或刪除損壞的索引，再重新掃描。
+
 ### Rescan Selected
 
-重新掃描目前反白選取的既有 Music Root。
+重新掃描目前反白選取的既有 Music Root。若只反白 `E:\Music\FLAC` 之類的子資料夾，程式只更新該子資料夾；若反白父資料夾 `E:\Music`，也會一併更新其下所有資料夾。過程不會建立重複的歌曲記錄。
 
 適合以下情況：
 
@@ -144,7 +147,7 @@ Music Root 可能顯示以下狀態：
 
 ### Remove Selected
 
-從 Music Roots 清單及索引中移除目前選取的路徑。
+移除目前選取的路徑。若子資料夾沿用父資料夾索引，移除子資料夾只會改變可選擇的 Repair 範圍。若移除父資料夾，但 Music Roots 中仍保留一個或多個子資料夾，程式會把既有歌曲索引交給最上層的保留子資料夾，它們會保持 `[Ready]`，不需要重新掃描；只有不屬於任何保留子路徑的歌曲記錄才會從索引移除。只有找不到可保留的索引資料時，子資料夾才會變成 `[Needs scan]`。
 
 取消核取方塊不等於刪除；只有使用 Remove Selected 才會真正移除。
 
@@ -201,6 +204,8 @@ Resolved 不只是完成清單，也是一個檢查區。若程式自動選錯�
 
 建立修復後的播放清單，並保存目前進度。
 
+儲存時可選擇 M3U8（UTF-8，建議）或 M3U（含 BOM 的 UTF-8，供舊版軟體相容）。
+
 ---
 
 ## 4. Music Roots 的正確使用方式
@@ -210,13 +215,13 @@ Resolved 不只是完成清單，也是一個檢查區。若程式自動選錯�
 1. 按下 `Add Music Folders`
 2. 選擇包含音樂檔案的資料夾
 3. 需要時繼續加入其他資料夾
-4. 新路徑會顯示 `[Pending scan]`
+4. 新路徑會顯示 `[Needs scan]`
 5. 按下 `Scan New Folders`
 6. 掃描成功後，該路徑會成為正式 Music Root
 
 新加入的路徑會保存於 Music Roots 清單中。即使資料夾暫時不存在、外接硬碟尚未連接、無法讀取，或掃描結果為 0，路徑也不會自動消失。
 
-若路徑存在但索引資料遺失，會顯示 `[Index missing]`；若路徑本身目前無法存取，會顯示 `[Unavailable]`。
+若路徑存在但索引資料遺失，會顯示 `[Index missing]`；若路徑本身目前無法存取，會顯示 `[Folder missing]`。
 
 ### 4.2 之後新增另一個音樂資料夾
 
@@ -264,7 +269,7 @@ Repair 只會從 `C:\PC Music` 尋找及使用檔案。
 
 `D:\DAP Music` 仍保留在索引中，只是本次 Repair 不會使用它。即使原播放清單中的某個 `D:\DAP Music` 路徑目前仍存在，只要該 Music Root 沒有勾選，Repair 也不會直接保留那個路徑。
 
-若勾選的 Music Root 顯示 `[Index missing]` 或 `[Unavailable]`，Repair 會先提示，避免使用者誤以為該路徑已可正常搜尋。
+若勾選的 Music Root 顯示 `[Index missing]` 或 `[Folder missing]`，Repair 會先提示，避免使用者誤以為該路徑已可正常搜尋。
 
 這可以避免：
 
@@ -321,7 +326,7 @@ Roon XLSX 可包含：
 
 即使 XLSX 來自另一台電腦、原始磁碟代號和資料夾結構不同，Playlist Fixer 仍會嘗試使用 metadata 與目前音樂索引進行配對。
 
-Roon XLSX 修復後會輸出為標準 M3U。輸出時會利用 XLSX 中可靠的 Track Artist、Album Artist 與 Title 建立 `#EXTINF`，避免修復後的歌單只剩路徑而失去一般 M3U 所需的歌曲資訊。若無法取得時長，會使用 `-1`；一般播放器仍可正常讀取。
+Roon XLSX 修復後可選擇儲存為 M3U8 或 M3U。輸出時會利用 XLSX 中可靠的 Track Artist、Album Artist 與 Title 建立 `#EXTINF`，避免修復後的歌單只剩路徑而失去一般播放清單所需的歌曲資訊。若無法取得時長，會使用 `-1`；一般播放器仍可正常讀取。
 
 ### Roon M3U
 
@@ -349,6 +354,8 @@ Playlist Fixer 會先拆解 Roon 路徑，再進行配對。
 6. Roon XLSX metadata 是否能對應本機標籤
 7. Roon M3U 的路徑結構是否能對應本機索引
 8. 多項資訊的綜合信心評分
+
+若歌曲仍未能安全判定，而且原始音檔仍可讀取，Playlist Fixer 可能會使用音檔內的標籤與時長進行最後驗證。只有這些資訊能唯一指向一個候選時才會自動修復；來源不存在、資訊衝突或候選平手時，仍會保留為未解決。
 
 為避免修錯，程式不會只因歌名相同就強行自動選擇。
 
@@ -494,27 +501,30 @@ Resolved 仍可以重新修改。修改後會暫時顯示 `✓`，Save 後記號
 
 ```text
 1.m3u
-fixed_1_selected.m3u
+fixed_1.m3u8
 ```
 
 兩者不會因名稱相近而共用狀態。
 
 - 開啟原始 `1.m3u`：視為原始未修復歌單
-- 開啟已儲存的 `fixed_1_selected.m3u`：讀取正式修復進度
+- 開啟已儲存的 `fixed_1.m3u8`：讀取正式修復進度
 
 ---
 
 ## 12. 儲存修復後的播放清單
 
-按下 `Save Fixed Playlist` 後，程式會建立：
+按下 `Save Fixed Playlist` 後，可選擇輸出格式：
 
 ```text
-fixed_*_selected.m3u
+M3U8（UTF-8，建議）                     → fixed_<原檔名>.m3u8
+M3U（含 BOM 的 UTF-8，供舊版軟體相容） → fixed_<原檔名>.m3u
 ```
 
 原始播放清單不會被覆蓋。
 
-Roon XLSX 修復後也會輸出為 M3U。
+Roon XLSX 修復後也可以選擇其中一種格式。
+
+同一份修復結果可以分別儲存為兩種格式；重新開啟任一輸出檔時，都可以讀取其修復進度。
 
 即使歌單尚未全部修完，也可以先 Save。下次重新開啟已儲存的修復歌單後，可繼續處理剩餘項目。
 
@@ -545,7 +555,7 @@ Playlist Fixer 會建立修復報告與進度資料，例如：
 
 保存已正式儲存的處理狀態，讓未完成的長歌單可以在下次繼續。
 
-### fixed_*_selected.m3u
+### fixed_*.m3u／fixed_*.m3u8
 
 最終輸出的修復播放清單。
 
@@ -555,13 +565,21 @@ Playlist Fixer 會建立修復報告與進度資料，例如：
 
 ## 14. 常見問題
 
-### 為什麼 Add Music Folders 後還顯示 Pending scan？
+### 為什麼 Add Music Folders 後還顯示 Needs scan？
 
 因為尚未建立索引。按下 `Scan New Folders` 後，掃描成功才會成為正式 Music Root。
 
+### 為什麼 Music Root 顯示 Index missing？
+
+路徑目前存在，但找不到對應的索引資料，或索引尚未建立。請掃描或重新掃描該 Music Root。
+
+### 為什麼 Music Root 顯示 Folder missing？
+
+目前無法存取該資料夾或外接硬碟。請重新連接硬碟，或確認資料夾已恢復可用。
+
 ### Scan New Folders 會重新掃描所有歌曲嗎？
 
-不會。它只掃描新加入、仍為 Pending 的資料夾。
+不會。它只掃描新加入、仍需要掃描的資料夾。
 
 ### 什麼時候需要 Rescan Selected？
 
@@ -627,7 +645,7 @@ Music Roots 是每台電腦各自保存的設定。程式資料夾裡的索引�
 
 ### Playlist Fixer 會覆蓋原始播放清單嗎？
 
-不會。它會建立新的 `fixed_*_selected.m3u`。
+不會。它會建立新的 `fixed_<原檔名>.m3u8` 或 `fixed_<原檔名>.m3u`。
 
 ### 是否需要網路？
 

@@ -22,7 +22,7 @@ Playlist Fixer can help when:
 - Playlists are moved between PC, Mac, and DAP devices
 - A DAP loads only part of a playlist
 - Roon exports point to paths from another computer
-- Roon forces you to export audio files together with an M3U, but you only want the playlist✨
+- Roon forces you to export audio files together with an M3U, but you only want the playlist
 - A playlist contains broken, outdated, relative, or device-specific paths
 
 ---
@@ -49,7 +49,7 @@ Playlist Fixer can help when:
 - Save unfinished repair progress and continue later
 - Keep unsaved Repair results temporary
 - Generate CSV reports for review and troubleshooting
-- Export a new repaired M3U playlist without changing the original
+- Save repaired playlists as `.m3u8` (UTF-8, recommended) or `.m3u` (legacy compatibility) without changing the original
 
 ---
 
@@ -144,6 +144,8 @@ Playlist Fixer is designed to avoid destructive changes:
 6. Review Unresolved and Resolved tracks
 7. Correct any ambiguous, failed, or incorrect matches
 8. Save the repaired playlist
+
+When an indexed parent folder already contains a child folder, the child becomes ready immediately and can be selected independently for Repair. The existing index is reused in the background, so the same files are not scanned twice.
 
 For detailed instructions, see the full manuals below.
 
